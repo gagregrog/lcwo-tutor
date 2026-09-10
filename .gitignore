@@ -1,0 +1,38 @@
+# ---- your practice data: never commit ----
+# The database is the record of every session you have run.
+lcwo.db
+*.db
+# SQLite sidecars, present while a connection is open or after a crash
+*.db-journal
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite3
+
+# Generated reports embed the whole graded dataset as JSON, so publishing one
+# publishes everything lcwo.db holds. Rebuild any time with `make report`.
+reports/
+exports/
+# catches `lcwo.py report -o somewhere.html` landing in the tree; this project
+# has no other HTML, so the blanket rule costs nothing
+*.html
+
+*.bak
+
+import_history.py
+
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+
+# ---- editors / OS ----
+.DS_Store
+.idea/
+.vscode/
+*.swp
