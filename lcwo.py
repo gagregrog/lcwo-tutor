@@ -1744,6 +1744,9 @@ def ask_choice(prompt, options: list[tuple[str, str]], default=1) -> str:
 
 
 def ask_yes_no(prompt, default=True) -> bool:
+    """Enter always means yes. Nothing here is destructive enough to be worth
+    a moving default - a prompt whose answer changes underneath you trains you
+    to stop reading it."""
     d = "Y/n" if default else "y/N"
     while True:
         try:
@@ -2019,7 +2022,7 @@ def new_group(con, op=None):
     while True:
         rule("New assignment")
         assignment = ask_text("Assignment (e.g. S2HW3)")
-        if ask_yes_no(f"   start assignment {bold(assignment)}?", True):
+        if ask_yes_no(f"   start assignment {bold(assignment)}?"):
             gid = create_group(con, assignment=assignment, label=assignment,
                                operator_id=op["id"] if op else None)
             print(green(f"\n  ✓ group {gid} created for {assignment}"))
@@ -2035,7 +2038,7 @@ def session_settings(con, grp):
     if prev and prev["mode"]:
         cur = (f"{dict(MODES).get(prev['mode'], prev['mode'])}"
                f" at {fmt_wpm(prev['char_wpm'])}/{fmt_wpm(prev['eff_wpm'])} wpm")
-        if not ask_yes_no(f"  Same as last session ({cur})?", True):
+        if not ask_yes_no(f"  Same as last session ({cur})?"):
             return ask_settings(prev["char_wpm"], prev["eff_wpm"])
         return prev["mode"], prev["char_wpm"], prev["eff_wpm"]
     return ask_settings()
@@ -2080,9 +2083,9 @@ def cmd_record(args) -> int:
             done = len(group_sessions(con, grp["id"]))
             if done >= SOFT_SESSION_LIMIT:
                 print(dim(f"\n  ({done} sessions in this group)"))
-            if not ask_yes_no("\nAnother session in this group?", done < SOFT_SESSION_LIMIT):
+            if not ask_yes_no("\nAnother session in this group?"):
                 break
-        if ask_yes_no("Close this group?", True):
+        if ask_yes_no("Close this group?"):
             close_group(con, grp["id"])
     except (Abort, KeyboardInterrupt):
         print(dim("\n  bye — everything recorded so far is saved"))
@@ -2101,7 +2104,7 @@ def cmd_record(args) -> int:
                 print(green(f"\n  ✓ report: {out}"))
                 if still_there:
                     print(green(f"  ✓ group:  {write_report(con, grp['id'])}"))
-                if _TTY and ask_yes_no("Open the report?", True):
+                if _TTY and ask_yes_no("Open the report?"):
                     # land on the group just finished; the filter can still
                     # widen to all time from there
                     url = out.resolve().as_uri()
@@ -2525,7 +2528,7 @@ def cmd_delete(args) -> int:
         return 0
     print(f"  {bold(what)}")
     print(dim(f"      hides {scope_counts(con, kind, rid)}"))
-    if not args.yes and not ask_yes_no("  move to the bin?", True):
+    if not args.yes and not ask_yes_no("  move to the bin?"):
         return 0
     con.execute(f"UPDATE {TABLES[kind]} SET deleted_at=? WHERE id=?", (now_iso(), rid))
     con.commit()
