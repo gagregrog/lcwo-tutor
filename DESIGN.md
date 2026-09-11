@@ -105,6 +105,58 @@ invoked — and a quick-filter button that passed the wrong argument shipped
 looking fully tested.
 
 
+## Why drill type lives on the session
+
+An assignment alternates send and copy, and can change drill partway through —
+letters for the first copies, custom error characters for the last. If the drill
+were a group property, a single homework day would have to be split across two
+groups, which is what the first version did.
+
+The cost of folding them back together is that a group's aggregate miss rate now
+mixes normal letters with error practice, and error practice deliberately
+over-samples your worst characters. The filter absorbs that: pick a group to ask
+"how did this assignment go", pick a drill to ask "how am I doing on plain
+letters". Keeping the split in the data model would have answered the second
+question only, and permanently.
+
+`lcwo.py merge` folds groups that share an assignment into one, re-sequencing
+their sessions chronologically. It is a dry run unless given `--apply`, and it
+refuses to finish if the run count changes or a foreign key is left dangling.
+
+## Soft delete
+
+`groups`, `sessions` and `runs` each carry a nullable `deleted_at`. Rather than
+add `WHERE deleted_at IS NULL` to twenty-odd read queries and hope none is
+missed later, the rule lives in three SQL views:
+
+```sql
+CREATE VIEW live_groups AS
+    SELECT * FROM groups WHERE deleted_at IS NULL;
+CREATE VIEW live_sessions AS
+    SELECT s.* FROM sessions s JOIN groups g ON g.id = s.group_id
+    WHERE s.deleted_at IS NULL AND g.deleted_at IS NULL;
+CREATE VIEW live_runs AS
+    SELECT r.* FROM runs r JOIN live_sessions s ON s.id = r.session_id
+    WHERE r.deleted_at IS NULL;
+```
+
+Visibility therefore cascades by containment — binning a group hides its
+sessions and runs without writing to them, so restoring is a single update.
+The views are dropped and recreated on every connect, so a changed definition
+cannot go stale, and they are created *after* the column migration since they
+reference `deleted_at`.
+
+Two places deliberately read the base tables instead:
+
+- **sequence numbers.** `start_session` and `add_run` compute `seq` from the
+  base tables so a binned row keeps its slot and restoring cannot collide.
+- **`prune_empty`.** It removes sessions with no runs; reading `live_runs`
+  would make a session whose runs are merely binned look empty and hard-delete
+  it. It also skips binned rows entirely.
+
+`purge` is the only destructive command. It deletes children before parents and
+verifies `PRAGMA foreign_key_check` afterwards.
+
 ## Storage
 
 SQLite at `lcwo.db` next to the script — four tables (`groups`, `sessions`,

@@ -14,10 +14,16 @@ make help       everything else
 ## How it works
 
 ```
-group  ──  a batch of sessions at one drill / assignment / speed
- └ session  ──  one LCWO lesson = one audio clip
+group  ──  one homework assignment (S2HW3)
+ └ session  ──  one Copy exercise = one audio clip, with its own drill and speed
     └ run   ──  one attempt at that clip
 ```
+
+CW Academy homework alternates **Send 1 → Copy 1, Send 2 → Copy 2, …**. Only the
+copies are gradeable, so a send block is simply a gap: come back to copying and
+you add a *session*, not a new group. Drill type and speed belong to the session,
+because one assignment can start on letters and finish on custom error characters.
+A new group means a new assignment.
 
 While working a lesson you replay the same clip and retype your answers until
 you are happy with them. Paste each attempt as you go — two-character groups,
@@ -43,8 +49,9 @@ HR           SR               HR       1
 
 ## What you get
 
-A self-contained HTML report with a scope filter at the top — **all time, a
-day, a group, or a session** — that recomputes every panel for what you picked:
+A self-contained HTML report with a scope filter at the top — **all time, a day,
+an assignment, a drill type, or a single session** — that recomputes every panel
+for what you picked:
 
 - **Practice these** — characters missed twice or more, broken down across the
   level below whatever you are looking at
@@ -62,11 +69,37 @@ day, a group, or a session** — that recomputes every panel for what you picked
 | `make report` | rebuild the HTML report and open it |
 | `make groups` | list groups with accuracy and trouble letters |
 | `make trouble` | trouble letters in the terminal — `N=3` to change the threshold |
+| `make merge` | fold groups that share an assignment into one (`APPLY=1` to write) |
+| `make delete G=11` | move a group (or `S=`/`R=`) to the bin — reversible |
+| `make restore G=11` | bring it back |
+| `make trash` | list what's in the bin |
+| `make purge` | permanently delete everything in the bin |
+| `make db` | SQLite shell on the database |
 | `make key` | grade a session you left unfinished |
 | `make speed` | show or set a group's wpm — `G=2 CHAR=25 EFF=6` |
 | `make test` | run the Python and browser test suites |
 
 All of it works without `make` too: `python3 lcwo.py <command>`.
+
+## Demoing, and undoing
+
+Deleting is soft. `make delete G=11` stamps the row with `deleted_at` and it
+vanishes from every listing, stat and report — but nothing leaves the database,
+and `make restore G=11` brings it back. So you can record a throwaway group
+while showing someone the tool, then hide it afterwards without risking real
+practice data.
+
+Visibility cascades by containment: binning a group hides its sessions and runs
+without touching those rows, which is why restoring is one update rather than a
+bookkeeping exercise. You can also bin a single session or run (`S=`, `R=`).
+
+`make trash` lists the bin. `make purge` is the only command that destroys
+anything; it asks you to type `purge` to confirm.
+
+For anything the commands don't cover, `make db` opens a SQLite shell. The
+tables are `groups`, `sessions`, `runs`; the views `live_groups`,
+`live_sessions`, `live_runs` apply the bin rule for you, and are what the
+tool reads.
 
 ## Your data stays local
 

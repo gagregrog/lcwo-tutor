@@ -43,7 +43,7 @@ REPORT_DIR = Path(os.environ.get("LCWO_REPORTS", APP_DIR / "reports"))
 MODES = [
     ("letters", "Letters"),
     ("code_group", "Code group"),
-    ("custom", "Error practice (custom characters)"),
+    ("custom", "Error practice"),
 ]
 
 MISS_KINDS = ("missed", "wrong", "transposed")
@@ -322,14 +322,17 @@ PRAGMA foreign_keys = ON;
 CREATE TABLE IF NOT EXISTS groups (
     id          INTEGER PRIMARY KEY,
     label       TEXT,
-    mode        TEXT NOT NULL,
+    -- mode/speed on a group are only the defaults carried into the next
+    -- session; each session records its own, so these may be NULL
+    mode        TEXT,
     assignment  TEXT NOT NULL,
     char_wpm    REAL,
     eff_wpm     REAL,
     created_at  TEXT NOT NULL,
     closed_at   TEXT,
     notes       TEXT,
-    source      TEXT UNIQUE
+    source      TEXT UNIQUE,
+    deleted_at  TEXT
 );
 
 CREATE TABLE IF NOT EXISTS sessions (
@@ -344,6 +347,7 @@ CREATE TABLE IF NOT EXISTS sessions (
     ended_at    TEXT,
     key_json    TEXT,
     notes       TEXT,
+    deleted_at  TEXT,
     UNIQUE (group_id, seq)
 );
 
@@ -356,11 +360,33 @@ CREATE TABLE IF NOT EXISTS runs (
     attempt_json TEXT NOT NULL,
     reported_json TEXT,
     raw_paste    TEXT NOT NULL,
+    deleted_at   TEXT,
     UNIQUE (session_id, seq)
 );
 
 CREATE INDEX IF NOT EXISTS idx_sessions_group ON sessions(group_id);
 CREATE INDEX IF NOT EXISTS idx_runs_session ON runs(session_id);
+"""
+
+# Deleting is soft: rows stay put and gain a deleted_at stamp. Visibility
+# cascades by containment - a run disappears when its session or group is
+# deleted, without touching the child rows - so restoring is a single update.
+# Recreated on every connect so a definition change cannot go stale.
+VIEWS = """
+DROP VIEW IF EXISTS live_runs;
+DROP VIEW IF EXISTS live_sessions;
+DROP VIEW IF EXISTS live_groups;
+
+CREATE VIEW live_groups AS
+    SELECT * FROM groups WHERE deleted_at IS NULL;
+
+CREATE VIEW live_sessions AS
+    SELECT s.* FROM sessions s JOIN groups g ON g.id = s.group_id
+    WHERE s.deleted_at IS NULL AND g.deleted_at IS NULL;
+
+CREATE VIEW live_runs AS
+    SELECT r.* FROM runs r JOIN live_sessions s ON s.id = r.session_id
+    WHERE r.deleted_at IS NULL;
 """
 
 
@@ -370,12 +396,18 @@ def connect(path: Path = DB_PATH) -> sqlite3.Connection:
     con.row_factory = sqlite3.Row
     con.executescript(SCHEMA)
     migrate(con)
+    con.executescript(VIEWS)  # after migrate: the views reference deleted_at
     return con
 
 
 def table_ddl(table: str) -> str:
-    """Pull one CREATE TABLE statement out of SCHEMA (single source of truth)."""
-    for stmt in SCHEMA.split(";"):
+    """Pull one CREATE TABLE statement out of SCHEMA (single source of truth).
+
+    Comments are stripped first: a `;` inside a `--` comment would otherwise
+    split a statement in half and yield invalid SQL.
+    """
+    clean = "\n".join(re.sub(r"--.*$", "", ln) for ln in SCHEMA.splitlines())
+    for stmt in clean.split(";"):
         if f"CREATE TABLE IF NOT EXISTS {table}" in stmt:
             return stmt.strip()
     raise KeyError(table)
@@ -391,18 +423,23 @@ def migrate(con) -> None:
         ("groups", "notes", "TEXT"),
         ("groups", "source", "TEXT"),
         ("sessions", "notes", "TEXT"),
+        ("groups", "deleted_at", "TEXT"),
+        ("sessions", "deleted_at", "TEXT"),
+        ("runs", "deleted_at", "TEXT"),
     ):
         if col not in cols(table):
             con.execute(f"ALTER TABLE {table} ADD COLUMN {col} {decl}")
     con.commit()
 
-    stale = [t for t in ("groups", "sessions")
-             if any(c["notnull"] and c["name"] in ("char_wpm", "eff_wpm")
-                    for c in cols(t).values())]
+    # columns that became nullable as the model changed
+    relaxed = {"groups": ("char_wpm", "eff_wpm", "mode"),
+               "sessions": ("char_wpm", "eff_wpm")}
+    stale = [t for t, names in relaxed.items()
+             if any(c["notnull"] and c["name"] in names for c in cols(t).values())]
     if not stale:
         return
 
-    # Speeds became nullable, which SQLite can only do by rebuilding the table.
+    # Dropping NOT NULL is only possible by rebuilding the table in SQLite.
     # Foreign keys must be off (ON DELETE CASCADE would wipe the children when
     # the old table is dropped) and legacy_alter_table on (otherwise RENAME
     # rewrites the FK clauses of *other* tables to point at the _old name).
@@ -432,10 +469,11 @@ def migrate(con) -> None:
         raise SystemExit(f"migration left dangling references: {bad[:3]}")
 
 
-def create_group(con, mode, assignment, char_wpm, eff_wpm, label=None,
-                 created_at=None, notes=None, source=None) -> int:
-    label = label or (f"{dict(MODES).get(mode, mode)} #{assignment} "
-                      f"@ {fmt_wpm(char_wpm)}/{fmt_wpm(eff_wpm)}")
+def create_group(con, mode=None, assignment="", char_wpm=None, eff_wpm=None,
+                 label=None, created_at=None, notes=None, source=None) -> int:
+    """A group is one homework assignment. Its mode/speed columns are only the
+    defaults carried into the next session - each session records its own."""
+    label = label or str(assignment)
     cur = con.execute(
         "INSERT INTO groups (label, mode, assignment, char_wpm, eff_wpm, created_at,"
         " notes, source) VALUES (?,?,?,?,?,?,?,?)",
@@ -451,7 +489,7 @@ def fmt_wpm(v) -> str:
 
 def open_groups(con) -> list[sqlite3.Row]:
     return con.execute(
-        "SELECT * FROM groups WHERE closed_at IS NULL ORDER BY created_at DESC"
+        "SELECT * FROM live_groups WHERE closed_at IS NULL ORDER BY created_at DESC"
     ).fetchall()
 
 
@@ -459,7 +497,7 @@ def last_group(con) -> sqlite3.Row | None:
     """The most recently worked group, open or closed."""
     return con.execute(
         "SELECT g.*, COALESCE(MAX(s.started_at), g.created_at) AS activity"
-        " FROM groups g LEFT JOIN sessions s ON s.group_id = g.id"
+        " FROM live_groups g LEFT JOIN live_sessions s ON s.group_id = g.id"
         " GROUP BY g.id ORDER BY activity DESC, g.id DESC LIMIT 1"
     ).fetchone()
 
@@ -477,18 +515,25 @@ def prune_empty(con) -> tuple[int, int]:
     keeps an abandoned start from turning into a permanent empty group.
     """
     ns = con.execute(
-        "DELETE FROM sessions WHERE id NOT IN (SELECT session_id FROM runs)").rowcount
+        "DELETE FROM sessions WHERE id NOT IN (SELECT session_id FROM runs)"
+        " AND deleted_at IS NULL").rowcount
     ng = con.execute(
-        "DELETE FROM groups WHERE id NOT IN (SELECT group_id FROM sessions)").rowcount
+        "DELETE FROM groups WHERE id NOT IN (SELECT group_id FROM sessions)"
+        " AND deleted_at IS NULL").rowcount
     con.commit()
     return ns, ng
 
 
 def all_groups(con) -> list[sqlite3.Row]:
-    return con.execute("SELECT * FROM groups ORDER BY created_at").fetchall()
+    return con.execute("SELECT * FROM live_groups ORDER BY created_at").fetchall()
 
 
 def get_group(con, gid) -> sqlite3.Row | None:
+    return con.execute("SELECT * FROM live_groups WHERE id=?", (gid,)).fetchone()
+
+
+def get_group_any(con, gid) -> sqlite3.Row | None:
+    """Including soft-deleted, for restore and trash listings."""
     return con.execute("SELECT * FROM groups WHERE id=?", (gid,)).fetchone()
 
 
@@ -499,24 +544,32 @@ def close_group(con, gid) -> None:
 
 def group_sessions(con, gid) -> list[sqlite3.Row]:
     return con.execute(
-        "SELECT * FROM sessions WHERE group_id=? ORDER BY seq", (gid,)
+        "SELECT * FROM live_sessions WHERE group_id=? ORDER BY seq", (gid,)
     ).fetchall()
 
 
 def session_runs(con, sid) -> list[sqlite3.Row]:
-    return con.execute("SELECT * FROM runs WHERE session_id=? ORDER BY seq", (sid,)).fetchall()
+    return con.execute("SELECT * FROM live_runs WHERE session_id=? ORDER BY seq",
+                       (sid,)).fetchall()
 
 
-def start_session(con, grp, started_at=None, notes=None, mode=None) -> sqlite3.Row:
+def start_session(con, grp, started_at=None, notes=None, mode=None,
+                  char_wpm=..., eff_wpm=...) -> sqlite3.Row:
     seq = (con.execute(
         "SELECT COALESCE(MAX(seq),0) FROM sessions WHERE group_id=?", (grp["id"],)
     ).fetchone()[0]) + 1
+    mode = mode or grp["mode"]
+    char_wpm = grp["char_wpm"] if char_wpm is ... else char_wpm
+    eff_wpm = grp["eff_wpm"] if eff_wpm is ... else eff_wpm
     cur = con.execute(
         "INSERT INTO sessions (group_id, seq, mode, assignment, char_wpm, eff_wpm,"
         " started_at, notes) VALUES (?,?,?,?,?,?,?,?)",
-        (grp["id"], seq, mode or grp["mode"], grp["assignment"], grp["char_wpm"],
-         grp["eff_wpm"], started_at or now_iso(), notes),
+        (grp["id"], seq, mode, grp["assignment"], char_wpm, eff_wpm,
+         started_at or now_iso(), notes),
     )
+    # the group carries the latest settings forward as next session's default
+    con.execute("UPDATE groups SET mode=?, char_wpm=?, eff_wpm=? WHERE id=?",
+                (mode, char_wpm, eff_wpm, grp["id"]))
     con.commit()
     return con.execute("SELECT * FROM sessions WHERE id=?", (cur.lastrowid,)).fetchone()
 
@@ -719,6 +772,9 @@ def report_payload(views: list[GroupView]) -> dict:
             sessions.append({
                 "id": s["id"], "gid": g["id"], "seq": s["seq"],
                 "at": s["started_at"], "notes": _col(s, "notes"),
+                "mode": s["mode"],
+                "modeLabel": dict(MODES).get(s["mode"], s["mode"] or "-"),
+                "charWpm": s["char_wpm"], "effWpm": s["eff_wpm"],
             })
             for rv in sv.runs:
                 cells = []
@@ -735,6 +791,7 @@ def report_payload(views: list[GroupView]) -> dict:
     return {
         "generated": now_iso(),
         "troubleThreshold": TROUBLE_THRESHOLD,
+        "modes": dict(MODES),
         "groups": groups, "sessions": sessions, "runs": runs,
     }
 
@@ -813,6 +870,7 @@ tbody tr.click:hover{background:var(--chip)}
 .pill{display:inline-block;padding:.08rem .45rem;border-radius:999px;font-size:.75rem;font-weight:600}
 .pill.ok{background:var(--okbg);color:var(--ok)}
 .pill.trans{background:var(--transbg);color:var(--trans)}
+.pill.drill{background:var(--chip);color:var(--muted)}
 .pill.pending{background:var(--barbg);color:var(--muted)}
 .trouble{display:flex;flex-wrap:wrap;gap:.4rem}
 .tr-chip{display:flex;align-items:baseline;gap:.35rem;background:var(--badbg);color:var(--bad);
@@ -904,22 +962,32 @@ const trouble = st => [...st.miss.entries()]
 
 /* ---------- scopes ---------- */
 const days = [...new Set(graded.map(r => r.day))].sort();
+const drills = [...new Set(DATA.sessions.map(s => s.mode).filter(Boolean))].sort();
+const drillOf = r => S[r.sid].mode;
 function scopeRuns(sc){
   if (sc.t === 'all') return graded;
   if (sc.t === 'day') return graded.filter(r => r.day === sc.k);
   if (sc.t === 'group') return graded.filter(r => r.gid === +sc.k);
+  if (sc.t === 'drill') return graded.filter(r => drillOf(r) === sc.k);
   return graded.filter(r => r.sid === +sc.k);
 }
 function scopeLabel(sc){
   if (sc.t === 'all') return 'All time';
   if (sc.t === 'day') return fmtDay(sc.k);
   if (sc.t === 'group') return G[sc.k].label;
+  if (sc.t === 'drill') return (DATA.modes[sc.k] || sc.k) + ' — every assignment';
   const s = S[sc.k];
-  return `${G[s.gid].label} · session ${s.seq}`;
+  return `${G[s.gid].label} · session ${s.seq} · ${s.modeLabel}`;
 }
 /* the level below the current one, used for the trouble breakdown columns */
 function children(sc, runs){
   const key = sc.t === 'group' ? 'sid' : sc.t === 'session' ? 'seq' : 'gid';
+  if (sc.t === 'drill'){
+    const out = new Map();
+    for (const r of runs){ if (!out.has(r.gid)) out.set(r.gid, []); out.get(r.gid).push(r); }
+    return [...out.entries()].map(([k, rs]) =>
+      ({k, name: G[k].label, short: G[k].label, runs: rs}));
+  }
   const out = new Map();
   for (const r of runs){
     const k = r[key];
@@ -1063,9 +1131,13 @@ function panelRuns(sc, runs){
   const rows = runs.map((r, i) => {
     const st = stats([r]);
     const s = S[r.sid];
+    const drill = sc.t === 'drill' || drills.length < 2 ? ''
+      : ` <span class="pill drill">${esc(s.modeLabel)}</span>`;
     const where = sc.t === 'session' ? `Run ${r.seq}`
-      : `S${s.seq} R${r.seq}` + (sc.t === 'all' || sc.t === 'day'
-          ? ` <span class="pill pending">${esc(G[r.gid].label)}</span>` : '');
+      : `S${s.seq} R${r.seq}`
+        + (sc.t === 'all' || sc.t === 'day' || sc.t === 'drill'
+           ? ` <span class="pill pending">${esc(G[r.gid].label)}</span>` : '')
+        + drill;
     const missed = [...stats([r]).miss.keys()].sort().join(' ');
     return `<tr class="click" data-run="${i}">
       <td>${where} ${r.final ? '<span class="pill trans">final</span>' : ''}</td>
@@ -1130,11 +1202,16 @@ function panelChars(st){
 }
 
 function panelContext(sc, runs){
-  if (sc.t === 'all' || sc.t === 'day') return '';
+  // only a group or a session maps onto one assignment's settings
+  if (sc.t !== 'group' && sc.t !== 'session') return '';
   const g = sc.t === 'group' ? G[sc.k] : G[S[sc.k].gid];
-  const bits = [`<span>Mode <b>${esc(g.mode)}</b></span>`,
-    `<span>Assignment <b>${esc(g.assignment)}</b></span>`,
-    `<span>${esc(wpm(g))}</span>`];
+  const mine = DATA.sessions.filter(x => sc.t === 'group'
+    ? x.gid === +sc.k : x.id === +sc.k);
+  const uniq = a => [...new Set(a)].join(', ') || '-';
+  const bits = [`<span>Assignment <b>${esc(g.assignment)}</b></span>`,
+    `<span>Drill <b>${esc(uniq(mine.map(x => x.modeLabel)))}</b></span>`,
+    `<span>Speed <b>${esc(uniq(mine.map(x => x.charWpm == null ? 'not recorded'
+      : `${+x.charWpm}/${+x.effWpm} wpm`)))}</b></span>`];
   const note = sc.t === 'session' ? S[sc.k].notes : g.notes;
   return `<div class="panel"><h3>About this ${sc.t}</h3>
     <div class="scopeline" style="flex:1">${bits.join(' &middot; ')}</div>
@@ -1159,7 +1236,15 @@ function buildScopeSelect(){
   h += '<optgroup label="By group">';
   for (const g of [...DATA.groups].reverse())
     h += opt('group:' + g.id, g.label, graded.filter(r => r.gid === g.id).length);
-  h += '</optgroup><optgroup label="By session">';
+  h += '</optgroup>';
+  if (drills.length > 1){
+    h += '<optgroup label="By drill">';
+    for (const d of drills)
+      h += opt('drill:' + d, DATA.modes[d] || d,
+               graded.filter(r => drillOf(r) === d).length);
+    h += '</optgroup>';
+  }
+  h += '<optgroup label="By session">';
   for (const s of [...DATA.sessions].reverse()){
     const n = graded.filter(r => r.sid === s.id).length;
     if (n) h += opt('session:' + s.id, `${G[s.gid].label} · session ${s.seq}`, n);
@@ -1245,9 +1330,24 @@ document.getElementById('sub').textContent =
 
 buildScopeSelect();
 const QUICK = buildQuick();
-const fromHash = (location.hash || '').slice(1);
-const [ht, hk] = fromHash.split(':');
-setScope(ht && (ht === 'all' || hk) ? {t:ht, k:hk ?? null} : {t:'all', k:null});
+function scopeFromHash(){
+  const [t, k] = (location.hash || '').slice(1).split(':');
+  if (t === 'all') return {t:'all', k:null};
+  if (!t || !k) return null;
+  const known = t === 'day' ? days.includes(k)
+    : t === 'group' ? !!G[k] : t === 'session' ? !!S[k]
+    : t === 'drill' ? drills.includes(k) : false;
+  return known ? {t, k} : null;
+}
+setScope(scopeFromHash() || {t:'all', k:null});
+
+// following a #group:8 link into a tab that already has the report open would
+// otherwise change the URL and nothing else
+if (typeof window !== 'undefined' && window.addEventListener)
+  window.addEventListener('hashchange', () => {
+    const next = scopeFromHash();
+    if (next && !(next.t === sc.t && String(next.k) === String(sc.k))) setScope(next);
+  });
 """
 
 
@@ -1436,7 +1536,9 @@ def print_run_summary(g: RunGrade, label: str) -> None:
 
 def record_session(con, grp, sess) -> str:
     """Run the paste loop for one session. Returns graded | pending | drop."""
-    rule(f"Group {grp['id']} · Session {sess['seq']}")
+    rule(f"{grp['label']} · Session {sess['seq']} · "
+         f"{dict(MODES).get(sess['mode'], sess['mode'])} @ "
+         f"{fmt_wpm(sess['char_wpm'])}/{fmt_wpm(sess['eff_wpm'])} wpm")
     recorded = 0
     while True:
         text = read_paste(
@@ -1489,15 +1591,30 @@ def report_session(con, grp, sess) -> None:
     print("  group trouble:   " + (", ".join(f"{ch}×{n}" for ch, n in gt) if gt else dim("none")))
 
 
+def group_drills(con, gid) -> str:
+    rows = con.execute("SELECT DISTINCT mode FROM live_sessions WHERE group_id=?"
+                       " ORDER BY mode", (gid,)).fetchall()
+    names = [dict(MODES).get(r[0], r[0]) for r in rows if r[0]]
+    return ", ".join(names) if names else "-"
+
+
+def group_speeds(con, gid) -> str:
+    rows = con.execute(
+        "SELECT DISTINCT char_wpm, eff_wpm FROM live_sessions WHERE group_id=?"
+        " AND char_wpm IS NOT NULL ORDER BY char_wpm", (gid,)).fetchall()
+    if not rows:
+        return "speed not recorded"
+    return ", ".join(f"{fmt_wpm(r[0])}/{fmt_wpm(r[1])}" for r in rows) + " wpm"
+
+
 def group_line(con, g) -> str:
-    ns = con.execute("SELECT COUNT(*) FROM sessions WHERE group_id=?",
+    ns = con.execute("SELECT COUNT(*) FROM live_sessions WHERE group_id=?",
                      (g["id"],)).fetchone()[0]
-    nr = con.execute("SELECT COUNT(*) FROM runs r JOIN sessions s ON s.id=r.session_id"
-                     " WHERE s.group_id=?", (g["id"],)).fetchone()[0]
-    speed = (f"{fmt_wpm(g['char_wpm'])}/{fmt_wpm(g['eff_wpm'])} wpm"
-             if g["char_wpm"] is not None else "speed not recorded")
+    nr = con.execute("SELECT COUNT(*) FROM live_runs r JOIN live_sessions s"
+                     " ON s.id=r.session_id WHERE s.group_id=?", (g["id"],)).fetchone()[0]
     state = "closed" if g["closed_at"] else "open"
-    return (f"{ns} session(s), {nr} run(s) · {speed} · {state}")
+    return (f"{ns} session(s), {nr} run(s) · {group_drills(con, g['id'])}"
+            f" · {group_speeds(con, g['id'])} · {state}")
 
 
 def choose_group(con):
@@ -1547,22 +1664,39 @@ def pick_group(con):
 
 
 def new_group(con):
+    """A group is one homework assignment. Drill and speed are asked per
+    session, because a single assignment alternates copy and send and can
+    change drill partway through."""
     while True:
-        rule("New group")
-        mode = ask_choice("1. What kind of drill?", MODES)
-        assignment = ask_text("2. Assignment number")
-        char_wpm = ask_number("3. Character speed (wpm)", 20)
-        eff_wpm = ask_number("4. Effective speed (wpm)", fmt_wpm(char_wpm))
-        print(f"\n{bold('5. Confirm')}")
-        print(f"     drill:      {dict(MODES)[mode]}")
-        print(f"     assignment: {assignment}")
-        print(f"     char speed: {fmt_wpm(char_wpm)} wpm")
-        print(f"     effective:  {fmt_wpm(eff_wpm)} wpm")
-        if ask_yes_no("   look right?", True):
-            gid = create_group(con, mode, assignment, char_wpm, eff_wpm)
-            print(green(f"\n  ✓ group {gid} created"))
+        rule("New assignment")
+        assignment = ask_text("Assignment (e.g. S2HW3)")
+        if ask_yes_no(f"   start assignment {bold(assignment)}?", True):
+            gid = create_group(con, assignment=assignment, label=assignment)
+            print(green(f"\n  ✓ group {gid} created for {assignment}"))
             return get_group(con, gid)
         print(dim("  starting over\n"))
+
+
+def session_settings(con, grp):
+    """Drill and speed for the next session, carrying the last one forward."""
+    prev = con.execute(
+        "SELECT mode, char_wpm, eff_wpm FROM live_sessions WHERE group_id=?"
+        " ORDER BY seq DESC LIMIT 1", (grp["id"],)).fetchone()
+    if prev and prev["mode"]:
+        cur = (f"{dict(MODES).get(prev['mode'], prev['mode'])}"
+               f" at {fmt_wpm(prev['char_wpm'])}/{fmt_wpm(prev['eff_wpm'])} wpm")
+        if not ask_yes_no(f"  Same as last session ({cur})?", True):
+            return ask_settings(prev["char_wpm"], prev["eff_wpm"])
+        return prev["mode"], prev["char_wpm"], prev["eff_wpm"]
+    return ask_settings()
+
+
+def ask_settings(char_default=25, eff_default=None):
+    mode = ask_choice("Which drill?", MODES)
+    char_wpm = ask_number("Character speed (wpm)", fmt_wpm(char_default or 25))
+    eff_wpm = ask_number("Effective speed (wpm)",
+                         fmt_wpm(eff_default if eff_default is not None else char_wpm))
+    return mode, char_wpm, eff_wpm
 
 
 def cmd_record(args) -> int:
@@ -1575,7 +1709,8 @@ def cmd_record(args) -> int:
     try:
         grp = pick_group(con)
         while True:
-            sess = start_session(con, grp)
+            mode, cw, ew = session_settings(con, grp)
+            sess = start_session(con, grp, mode=mode, char_wpm=cw, eff_wpm=ew)
             try:
                 status = record_session(con, grp, sess)
             except (Abort, KeyboardInterrupt):
@@ -1603,13 +1738,18 @@ def cmd_record(args) -> int:
         prune_empty(con)
         try:
             still_there = grp is not None and get_group(con, grp["id"]) is not None
-            if con.execute("SELECT COUNT(*) FROM runs").fetchone()[0]:
+            if con.execute("SELECT COUNT(*) FROM live_runs").fetchone()[0]:
                 out = write_report(con)
                 print(green(f"\n  ✓ report: {out}"))
                 if still_there:
                     print(green(f"  ✓ group:  {write_report(con, grp['id'])}"))
                 if _TTY and ask_yes_no("Open the report?", True):
-                    webbrowser.open(out.resolve().as_uri())
+                    # land on the group just finished; the filter can still
+                    # widen to all time from there
+                    url = out.resolve().as_uri()
+                    if still_there:
+                        url += f"#group:{grp['id']}"
+                    webbrowser.open(url)
         except (Abort, KeyboardInterrupt):
             pass
         con.close()
@@ -1628,7 +1768,8 @@ def cmd_groups(args) -> int:
         print(dim("no groups yet — run `python3 lcwo.py` to start one"))
         return 0
     rule("Groups")
-    print(f"  {'id':>3}  {'label':<40} {'sess':>4} {'runs':>4} {'wrong':>6} {'trouble'}")
+    print(f"  {'id':>3}  {'assignment':<12} {'drills':<26} {'sess':>4} {'runs':>4} "
+          f"{'wrong':>6}  trouble")
     for v in views:
         runs = v.graded_runs
         tot = sum(r.grade.total_chars for r in runs)
@@ -1636,7 +1777,8 @@ def cmd_groups(args) -> int:
         pct = f"{100.0 * wr / tot:.1f}%" if tot else "-"
         tr = ",".join(ch for ch, _ in v.trouble()) or "-"
         state = "" if not v.row["closed_at"] else dim(" (closed)")
-        print(f"  {v.row['id']:>3}  {v.row['label'][:40]:<40} {len(v.sessions):>4} "
+        print(f"  {v.row['id']:>3}  {v.row['label'][:12]:<12} "
+              f"{group_drills(con, v.row['id'])[:26]:<26} {len(v.sessions):>4} "
               f"{len(runs):>4} {pct:>6}  {tr}{state}")
     con.close()
     return 0
@@ -1677,14 +1819,15 @@ def cmd_key(args) -> int:
     """Attach a results table to a session that was left ungraded."""
     con = connect()
     pending = con.execute(
-        "SELECT s.*, g.label FROM sessions s JOIN groups g ON g.id = s.group_id"
+        "SELECT s.*, g.label FROM live_sessions s JOIN live_groups g ON g.id = s.group_id"
         " WHERE s.key_json IS NULL ORDER BY s.started_at"
     ).fetchall()
     if not pending:
         print(dim("no ungraded sessions"))
         return 0
     if args.session:
-        sess = con.execute("SELECT * FROM sessions WHERE id=?", (args.session,)).fetchone()
+        sess = con.execute("SELECT * FROM live_sessions WHERE id=?",
+                           (args.session,)).fetchone()
         if sess is None:
             raise SystemExit(f"no such session: {args.session}")
     else:
@@ -1694,7 +1837,7 @@ def cmd_key(args) -> int:
             print(f"  {s['id']}) {s['label']} · session {s['seq']} · {n} run(s) · "
                   f"{fmt_ts(s['started_at'])}")
         sid = ask_text("which session", str(pending[0]["id"]))
-        sess = con.execute("SELECT * FROM sessions WHERE id=?", (int(sid),)).fetchone()
+        sess = con.execute("SELECT * FROM live_sessions WHERE id=?", (int(sid),)).fetchone()
         if sess is None:
             raise SystemExit("no such session")
 
@@ -1723,7 +1866,7 @@ def cmd_speed(args) -> int:
     """Fill in the speed for groups whose source note never recorded one."""
     con = connect()
     if args.char is None and args.eff is None:  # nothing to set: just report
-        sql = "SELECT id, label, char_wpm, eff_wpm FROM groups"
+        sql = "SELECT id, label, char_wpm, eff_wpm FROM live_groups"
         params = ()
         if args.group is not None:
             sql += " WHERE id=?"
@@ -1752,6 +1895,245 @@ def cmd_speed(args) -> int:
         raise SystemExit(f"no such group: {args.group}")
     print(green(f"  ✓ group {args.group} set to "
                 f"{fmt_wpm(args.char)}/{fmt_wpm(args.eff)} wpm"))
+    con.close()
+    return 0
+
+
+def merge_plan(con) -> list[dict]:
+    """Groups that share an assignment, oldest first, and what they'd become."""
+    rows = con.execute("SELECT * FROM live_groups ORDER BY created_at, id").fetchall()
+    buckets: dict[str, list] = {}
+    for g in rows:
+        buckets.setdefault((g["assignment"] or "").strip().upper(), []).append(g)
+    plan = []
+    for key, gs in buckets.items():
+        if not key:
+            continue
+        target, rest = gs[0], gs[1:]
+        if not rest and target["label"] == key:
+            continue  # already the shape we want
+        plan.append({"assignment": key, "target": target, "absorb": rest})
+    return plan
+
+
+def merge_groups(con, entry) -> None:
+    """Fold `absorb` into `target`, re-sequencing sessions chronologically."""
+    target, absorb = entry["target"], entry["absorb"]
+    tid = target["id"]
+    ids = [tid] + [g["id"] for g in absorb]
+    marks = ",".join("?" * len(ids))
+    sessions = con.execute(
+        f"SELECT id FROM sessions WHERE group_id IN ({marks})"
+        " ORDER BY started_at, group_id, seq", ids).fetchall()
+
+    # UNIQUE(group_id, seq) means the incoming rows have to be parked out of the
+    # way before they can be renumbered into one continuous sequence.
+    for s in sessions:
+        con.execute("UPDATE sessions SET seq=? WHERE id=?", (-s["id"], s["id"]))
+    for s in sessions:
+        con.execute("UPDATE sessions SET group_id=? WHERE id=?", (tid, s["id"]))
+    for i, s in enumerate(sessions, 1):
+        con.execute("UPDATE sessions SET seq=? WHERE id=?", (i, s["id"]))
+
+    notes = [n for n in (target["notes"] or "").splitlines() if n.strip()]
+    for g in absorb:
+        for n in (g["notes"] or "").splitlines():
+            if n.strip() and n not in notes:
+                notes.append(n)
+        if g["source"]:
+            line = f"Merged in {g['source']}."
+            if line not in notes:
+                notes.append(line)
+    closed = [g["closed_at"] for g in [target] + absorb]
+    latest = con.execute(
+        "SELECT mode, char_wpm, eff_wpm FROM live_sessions WHERE group_id=?"
+        " ORDER BY seq DESC LIMIT 1", (tid,)).fetchone()
+    con.execute(
+        "UPDATE groups SET label=?, notes=?, closed_at=?, mode=?, char_wpm=?, eff_wpm=?"
+        " WHERE id=?",
+        (entry["assignment"], "\n".join(notes) or None,
+         max(closed) if all(closed) else None,
+         latest["mode"] if latest else None,
+         latest["char_wpm"] if latest else None,
+         latest["eff_wpm"] if latest else None, tid))
+    for g in absorb:
+        con.execute("DELETE FROM groups WHERE id=?", (g["id"],))
+    con.commit()
+
+
+def cmd_merge(args) -> int:
+    con = connect()
+    plan = merge_plan(con)
+    if not plan:
+        print(dim("  nothing to merge - every assignment is already one group"))
+        return 0
+    rule("Merge groups that share an assignment")
+    for e in plan:
+        tgt, absorb = e["target"], e["absorb"]
+        ns = con.execute("SELECT COUNT(*) FROM live_sessions WHERE group_id=?",
+                         (tgt["id"],)).fetchone()[0]
+        moved = sum(con.execute("SELECT COUNT(*) FROM live_sessions WHERE group_id=?",
+                                (g["id"],)).fetchone()[0] for g in absorb)
+        print(f"\n  {bold(e['assignment'])}  → group {tgt['id']}"
+              f"  ({ns} session(s)" + (f" + {moved} moved in)" if moved else ")"))
+        print(f"      {dim('label: ' + repr(tgt['label']) + ' → ' + repr(e['assignment']))}")
+        for g in absorb:
+            n = con.execute("SELECT COUNT(*) FROM live_sessions WHERE group_id=?",
+                            (g["id"],)).fetchone()[0]
+            print(f"      {dim(f'absorb group {g[chr(34)+chr(34)] if False else g[chr(105)+chr(100)]}')}"
+                  f" {dim(repr(g['label']) + f' ({n} session(s))')}")
+    if not args.apply:
+        print(dim("\n  dry run - re-run with --apply to write\n"))
+        return 0
+    before = con.execute(
+        "SELECT COUNT(*) FROM runs").fetchone()[0]
+    for e in plan:
+        merge_groups(con, e)
+    after = con.execute("SELECT COUNT(*) FROM runs").fetchone()[0]
+    if before != after:
+        raise SystemExit(f"run count changed during merge: {before} -> {after}")
+    bad = con.execute("PRAGMA foreign_key_check").fetchall()
+    if bad:
+        raise SystemExit(f"merge left dangling references: {bad[:3]}")
+    print(green(f"\n  ✓ merged; {after} runs intact, "
+                f"{con.execute('SELECT COUNT(*) FROM groups').fetchone()[0]} groups remain\n"))
+    con.close()
+    return 0
+
+
+# --------------------------------------------------------------------------
+# the bin: soft delete, restore, purge
+# --------------------------------------------------------------------------
+
+TABLES = {"group": "groups", "session": "sessions", "run": "runs"}
+
+
+def _target(args):
+    picked = [(k, getattr(args, k)) for k in TABLES if getattr(args, k, None) is not None]
+    if len(picked) != 1:
+        raise SystemExit("pass exactly one of --group, --session or --run")
+    return picked[0]
+
+
+def scope_counts(con, kind, rid) -> str:
+    """What else disappears with this row, by containment."""
+    if kind == "group":
+        ns = con.execute("SELECT COUNT(*) FROM sessions WHERE group_id=?", (rid,)).fetchone()[0]
+        nr = con.execute("SELECT COUNT(*) FROM runs r JOIN sessions s ON s.id=r.session_id"
+                         " WHERE s.group_id=?", (rid,)).fetchone()[0]
+        return f"{ns} session(s) and {nr} run(s)"
+    if kind == "session":
+        nr = con.execute("SELECT COUNT(*) FROM runs WHERE session_id=?", (rid,)).fetchone()[0]
+        return f"{nr} run(s)"
+    return "1 run"
+
+
+def describe_row(con, kind, rid) -> str | None:
+    if kind == "group":
+        r = con.execute("SELECT id, label, deleted_at FROM groups WHERE id=?", (rid,)).fetchone()
+        return f"group {r['id']} ({r['label']})" if r else None
+    if kind == "session":
+        r = con.execute("SELECT s.id, s.seq, s.mode, g.label, s.deleted_at FROM sessions s"
+                        " JOIN groups g ON g.id=s.group_id WHERE s.id=?", (rid,)).fetchone()
+        return f"session {r['id']} ({r['label']} · session {r['seq']})" if r else None
+    r = con.execute("SELECT r.id, r.seq, s.seq ss, g.label, r.deleted_at FROM runs r"
+                    " JOIN sessions s ON s.id=r.session_id JOIN groups g ON g.id=s.group_id"
+                    " WHERE r.id=?", (rid,)).fetchone()
+    return f"run {r['id']} ({r['label']} · session {r['ss']} run {r['seq']})" if r else None
+
+
+def cmd_delete(args) -> int:
+    con = connect()
+    kind, rid = _target(args)
+    what = describe_row(con, kind, rid)
+    if what is None:
+        raise SystemExit(f"no such {kind}: {rid}")
+    already = con.execute(
+        f"SELECT deleted_at FROM {TABLES[kind]} WHERE id=?", (rid,)).fetchone()[0]
+    if already:
+        print(dim(f"  {what} is already in the bin (since {fmt_ts(already)})"))
+        return 0
+    print(f"  {bold(what)}")
+    print(dim(f"      hides {scope_counts(con, kind, rid)}"))
+    if not args.yes and not ask_yes_no("  move to the bin?", True):
+        return 0
+    con.execute(f"UPDATE {TABLES[kind]} SET deleted_at=? WHERE id=?", (now_iso(), rid))
+    con.commit()
+    print(green(f"  ✓ {what} moved to the bin — restore with "
+                f"`lcwo.py restore --{kind} {rid}`"))
+    con.close()
+    return 0
+
+
+def cmd_restore(args) -> int:
+    con = connect()
+    kind, rid = _target(args)
+    what = describe_row(con, kind, rid)
+    if what is None:
+        raise SystemExit(f"no such {kind}: {rid}")
+    n = con.execute(f"UPDATE {TABLES[kind]} SET deleted_at=NULL WHERE id=?", (rid,)).rowcount
+    con.commit()
+    print(green(f"  ✓ restored {what}") if n else dim(f"  {what} was not in the bin"))
+    # a child stays hidden while its parent is still binned
+    if kind in ("session", "run"):
+        col = "group_id" if kind == "session" else "session_id"
+        parent = "groups" if kind == "session" else "sessions"
+        pid = con.execute(f"SELECT {col} FROM {TABLES[kind]} WHERE id=?", (rid,)).fetchone()[0]
+        if con.execute(f"SELECT deleted_at FROM {parent} WHERE id=?", (pid,)).fetchone()[0]:
+            print(yellow(f"  ! its parent {parent[:-1]} {pid} is still in the bin, "
+                         "so this stays hidden until that is restored too"))
+    con.close()
+    return 0
+
+
+def cmd_trash(args) -> int:
+    con = connect()
+    rows = []
+    for kind, table in TABLES.items():
+        for r in con.execute(
+                f"SELECT id, deleted_at FROM {table} WHERE deleted_at IS NOT NULL"
+                " ORDER BY deleted_at"):
+            rows.append((r["deleted_at"], kind, r["id"]))
+    rule("Bin")
+    if not rows:
+        print(dim("  empty"))
+        return 0
+    for when, kind, rid in sorted(rows):
+        print(f"  {fmt_ts(when)}  {describe_row(con, kind, rid)}")
+    print(dim(f"\n  restore:  python3 lcwo.py restore --group ID"
+              f"\n  empty it: python3 lcwo.py purge"))
+    con.close()
+    return 0
+
+
+def cmd_purge(args) -> int:
+    """Permanently remove everything in the bin. The only destructive command."""
+    con = connect()
+    counts = {k: con.execute(
+        f"SELECT COUNT(*) FROM {t} WHERE deleted_at IS NOT NULL").fetchone()[0]
+        for k, t in TABLES.items()}
+    if not any(counts.values()):
+        print(dim("  bin is already empty"))
+        return 0
+    rule("Purge")
+    for k, n in counts.items():
+        if n:
+            print(f"  {n} {k}(s)")
+    print(red("  this cannot be undone."))
+    if not args.yes:
+        typed = ask_text('  type "purge" to confirm', "", allow_empty=True)
+        if typed.strip().lower() != "purge":
+            print(dim("  cancelled"))
+            return 0
+    # children first: deleting a group cascades, but a soft-deleted run inside a
+    # live session has to go on its own
+    for table in ("runs", "sessions", "groups"):
+        con.execute(f"DELETE FROM {table} WHERE deleted_at IS NOT NULL")
+    con.commit()
+    bad = con.execute("PRAGMA foreign_key_check").fetchall()
+    if bad:
+        raise SystemExit(f"purge left dangling references: {bad[:3]}")
+    print(green("  ✓ bin emptied"))
     con.close()
     return 0
 
@@ -1877,6 +2259,101 @@ def cmd_selftest(args) -> int:
         check("populated group survives prune", get_group(con, gid) is not None)
         check("prune is idempotent", prune_empty(con) == (0, 0))
 
+        # drill and speed belong to the session, not the assignment
+        mixed = create_group(con, assignment="MIX", label="MIX")
+        m1 = start_session(con, get_group(con, mixed), mode="letters",
+                           char_wpm=25, eff_wpm=6)
+        add_run(con, m1["id"], ["EH"], "raw", is_final=True)
+        finish_session(con, m1["id"], ["EH"])
+        check("group inherits the first session's settings",
+              get_group(con, mixed)["mode"] == "letters"
+              and get_group(con, mixed)["char_wpm"] == 25)
+        m2 = start_session(con, get_group(con, mixed), mode="custom",
+                           char_wpm=28, eff_wpm=8)
+        add_run(con, m2["id"], ["SM"], "raw", is_final=True)
+        finish_session(con, m2["id"], ["SM"])
+        check("one group holds two drills",
+              group_drills(con, mixed) == "Error practice, Letters")
+        check("each session keeps its own speed",
+              [r["char_wpm"] for r in group_sessions(con, mixed)] == [25, 28])
+        check("group default follows the latest session",
+              get_group(con, mixed)["mode"] == "custom")
+
+        # merging two groups that share an assignment
+        dup = create_group(con, assignment="MIX", label="MIX dup",
+                           created_at="2099-01-01T00:00:00+00:00")
+        d1 = start_session(con, get_group(con, dup), mode="letters",
+                           started_at="2099-01-01T00:00:00+00:00")
+        add_run(con, d1["id"], ["TR"], "raw", is_final=True)
+        finish_session(con, d1["id"], ["TR"])
+        runs_before = con.execute("SELECT COUNT(*) FROM runs").fetchone()[0]
+        plan = [e for e in merge_plan(con) if e["assignment"] == "MIX"]
+        check("merge plan finds the duplicate", len(plan) == 1
+              and [g["id"] for g in plan[0]["absorb"]] == [dup])
+        merge_groups(con, plan[0])
+        check("duplicate group is gone", get_group(con, dup) is None)
+        check("merge kept every run",
+              con.execute("SELECT COUNT(*) FROM runs").fetchone()[0] == runs_before)
+        merged = group_sessions(con, mixed)
+        check("sessions renumbered 1..n", [x["seq"] for x in merged] == [1, 2, 3])
+        check("sessions ordered by time",
+              [x["started_at"] for x in merged] == sorted(x["started_at"] for x in merged))
+        check("label normalised to the assignment", get_group(con, mixed)["label"] == "MIX")
+        check("merge is idempotent",
+              not [e for e in merge_plan(con) if e["assignment"] == "MIX"])
+
+        # the bin: soft delete hides rows without destroying them
+        demo = create_group(con, assignment="DEMO", label="DEMO")
+        ds = start_session(con, get_group(con, demo), mode="letters",
+                           char_wpm=25, eff_wpm=6)
+        add_run(con, ds["id"], ["EH", "SM"], "raw", is_final=True)
+        finish_session(con, ds["id"], ["EH", "SM"])
+        live0 = len(all_groups(con))
+        rows0 = con.execute("SELECT COUNT(*) FROM runs").fetchone()[0]
+
+        con.execute("UPDATE groups SET deleted_at=? WHERE id=?", (now_iso(), demo))
+        con.commit()
+        check("binned group hidden from listings", len(all_groups(con)) == live0 - 1)
+        check("binned group hidden from get_group", get_group(con, demo) is None)
+        check("binned group still fetchable for restore",
+              get_group_any(con, demo) is not None)
+        check("binned group's rows stay on disk",
+              con.execute("SELECT COUNT(*) FROM runs").fetchone()[0] == rows0)
+        check("binned group's sessions hidden", not con.execute(
+            "SELECT COUNT(*) FROM live_sessions WHERE group_id=?", (demo,)).fetchone()[0])
+        check("binned group's runs hidden by containment", not con.execute(
+            "SELECT COUNT(*) FROM live_runs WHERE session_id=?", (ds["id"],)).fetchone()[0])
+        check("binned group absent from the report payload",
+              all(g["id"] != demo for g in report_payload(load_all(con))["groups"]))
+        check("prune leaves binned rows alone", prune_empty(con) == (0, 0)
+              and get_group_any(con, demo) is not None)
+
+        con.execute("UPDATE groups SET deleted_at=NULL WHERE id=?", (demo,))
+        con.commit()
+        check("restore brings the group back", get_group(con, demo) is not None)
+        check("restore brings its runs back", con.execute(
+            "SELECT COUNT(*) FROM live_runs WHERE session_id=?", (ds["id"],)).fetchone()[0] == 1)
+
+        # a run binned on its own, inside a live session
+        rid = con.execute("SELECT id FROM runs WHERE session_id=?", (ds["id"],)).fetchone()[0]
+        con.execute("UPDATE runs SET deleted_at=? WHERE id=?", (now_iso(), rid))
+        con.commit()
+        check("binned run hidden, session still live", not session_runs(con, ds["id"])
+              and con.execute("SELECT COUNT(*) FROM live_sessions WHERE id=?",
+                              (ds["id"],)).fetchone()[0] == 1)
+        check("prune keeps a session whose only run is binned",
+              prune_empty(con) == (0, 0) and con.execute(
+                  "SELECT COUNT(*) FROM sessions WHERE id=?", (ds["id"],)).fetchone()[0] == 1)
+        con.execute("UPDATE runs SET deleted_at=NULL WHERE id=?", (rid,))
+        con.execute("UPDATE groups SET deleted_at=? WHERE id=?", (now_iso(), demo))
+        con.commit()
+        for t in ("runs", "sessions", "groups"):
+            con.execute(f"DELETE FROM {t} WHERE deleted_at IS NOT NULL")
+        con.commit()
+        check("purge removes the rows for good", get_group_any(con, demo) is None)
+        check("purge left no dangling references",
+              not con.execute("PRAGMA foreign_key_check").fetchall())
+
         # a hostile label must not be able to close the data script tag
         nasty = create_group(con, "letters", "x", 20, 10,
                              label='</script><img src=x onerror=alert(1)>')
@@ -1936,6 +2413,24 @@ def main(argv=None) -> int:
     sp.add_argument("--char", type=float, help="character speed in wpm")
     sp.add_argument("--eff", type=float, help="effective speed in wpm")
     sp.set_defaults(fn=cmd_speed)
+
+    for name, helptext in (("delete", "move a group/session/run to the bin"),
+                           ("restore", "bring one back from the bin")):
+        q = sub.add_parser(name, help=helptext)
+        q.add_argument("-g", "--group", type=int)
+        q.add_argument("-s", "--session", type=int)
+        q.add_argument("-r", "--run", type=int)
+        q.add_argument("-y", "--yes", action="store_true", help="skip the prompt")
+        q.set_defaults(fn=cmd_delete if name == "delete" else cmd_restore)
+
+    sub.add_parser("trash", help="list what is in the bin").set_defaults(fn=cmd_trash)
+    pg = sub.add_parser("purge", help="permanently delete everything in the bin")
+    pg.add_argument("-y", "--yes", action="store_true", help="skip the confirmation")
+    pg.set_defaults(fn=cmd_purge)
+
+    mg = sub.add_parser("merge", help="merge groups that share an assignment")
+    mg.add_argument("--apply", action="store_true", help="write the change")
+    mg.set_defaults(fn=cmd_merge)
 
     sub.add_parser("selftest", help="run built-in checks").set_defaults(fn=cmd_selftest)
 

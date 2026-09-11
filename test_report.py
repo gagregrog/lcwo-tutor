@@ -69,6 +69,13 @@ global.document = {getElementById: mk,
   querySelectorAll: sel => mk('quick').querySelectorAll(sel)};
 global.location = {hash: ''};
 global.history = {replaceState(a, b, h){ global.location.hash = h; }};
+const _listeners = {};
+global.window = {addEventListener(ev, fn){ (_listeners[ev] ||= []).push(fn); }};
+// set the fragment and fire hashchange, the way following a link would
+global.dispatchHash = h => {
+  global.location.hash = h;
+  (_listeners.hashchange || []).forEach(f => f());
+};
 let FAIL = 0;
 global.check = (name, ok, extra) => {
   if (ok) console.log('  ok   ' + name);
@@ -93,6 +100,49 @@ for (const b of btns){
   const h = document.getElementById('app').innerHTML;
   check('button "' + entry[0] + '" renders', h.length > 200 && !/undefined|NaN/.test(h));
 }
+
+// ---- deep links: `record` opens the report at #group:<id> ----
+const gid = String(DATA.groups[0].id);
+location.hash = '#group:' + gid;
+check('#group:<id> parses to that group',
+      JSON.stringify(scopeFromHash()) === JSON.stringify({t:'group', k:gid}));
+location.hash = '#all';
+check('#all parses', (scopeFromHash() || {}).t === 'all');
+location.hash = '#group:99999';
+check('unknown id falls back to all time', scopeFromHash() === null);
+location.hash = '#nonsense';
+check('malformed fragment falls back to all time', scopeFromHash() === null);
+location.hash = '';
+check('no fragment falls back to all time', scopeFromHash() === null);
+
+setScope({t:'all', k:null});
+dispatchHash('#group:' + gid);
+check('hashchange re-scopes an open page',
+      sc.t === 'group' && String(sc.k) === gid, 'sc=' + JSON.stringify(sc));
+const deepHtml = document.getElementById('app').innerHTML;
+check('deep-linked view renders', deepHtml.length > 200 && !/undefined|NaN/.test(deepHtml));
+check('deep-linked view is scoped to one group',
+      new Set(scopeRuns(sc).map(r => r.gid)).size === 1);
+
+// ---- drill is its own filter dimension ----
+check('two drills detected', drills.length === 2, drills.join(','));
+for (const d of drills){
+  setScope({t:'drill', k:d});
+  const rs = scopeRuns(sc);
+  check('drill "' + d + '" selects only its sessions',
+        rs.length > 0 && rs.every(r => drillOf(r) === d));
+  const h = document.getElementById('app').innerHTML;
+  check('drill "' + d + '" renders', h.length > 200 && !/undefined|NaN/.test(h));
+}
+const sum = drills.reduce((n, d) => n + scopeRuns({t:'drill', k:d}).length, 0);
+check('drill scopes partition every run', sum === graded.length, sum + ' vs ' + graded.length);
+location.hash = '#drill:' + drills[0];
+check('#drill:<mode> deep links', (scopeFromHash() || {}).t === 'drill');
+location.hash = '#drill:nosuchdrill';
+check('unknown drill falls back', scopeFromHash() === null);
+setScope({t:'group', k:String(DATA.groups[0].id)});
+check('mixed group shows a drill badge',
+      document.getElementById('app').innerHTML.includes('pill drill'));
 
 // ---- every scope renders ----
 const scopes = [{t:'all', k:null}, ...days.map(d => ({t:'day', k:d})),
@@ -178,18 +228,23 @@ def harness(html: str, tests: str, expect: dict | None = None) -> str:
 
 def build_fixture(con) -> list:
     """A small group with known properties, including a transposition."""
-    gid = lcwo.create_group(con, "letters", "fixture", 25, 6, label="Fixture · Letters")
+    gid = lcwo.create_group(con, assignment="FIXTURE", label="FIXTURE")
     grp = lcwo.get_group(con, gid)
     key = ["EH", "SM", "TR", "BU", "WM", "QX"]
-    sess = lcwo.start_session(con, grp)
+    sess = lcwo.start_session(con, grp, mode="letters", char_wpm=25, eff_wpm=6)
     for i, attempt in enumerate([["EH", "S.", "T.", ".U", "MW", "QX"],
                                  ["EH", "SM", "TR", "BU", "WM", "QX"]]):
         lcwo.add_run(con, sess["id"], attempt, "fixture", is_final=(i == 1))
     lcwo.finish_session(con, sess["id"], key)
-    sess2 = lcwo.start_session(con, grp)
+    sess2 = lcwo.start_session(con, grp, mode="letters", char_wpm=25, eff_wpm=6)
     lcwo.add_run(con, sess2["id"], ["EH", "SM", "TR", "BU", "MW", "QX"], "fixture",
                  is_final=True)
     lcwo.finish_session(con, sess2["id"], key)
+    # a second drill in the same assignment, so the drill filter has something
+    # to separate
+    sess3 = lcwo.start_session(con, grp, mode="custom", char_wpm=28, eff_wpm=8)
+    lcwo.add_run(con, sess3["id"], ["KY", "V.", "JZ"], "fixture", is_final=True)
+    lcwo.finish_session(con, sess3["id"], ["KY", "VG", "JZ"])
     return lcwo.load_all(con)
 
 
