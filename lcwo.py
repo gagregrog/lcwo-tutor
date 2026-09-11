@@ -2,8 +2,10 @@
 """
 lcwo.py - grade LCWO (Learn CW Online) practice assignments.
 
-Hierarchy:  group  >  session  >  run
+Hierarchy:  operator  >  group  >  session  >  run
 
+  operator who is copying - a name and a call sign. Every group belongs to
+           one, so several operators can share a database.
   group    a batch of 2-3 sessions sharing a mode / assignment / speed
   session  one LCWO lesson = one audio clip
   run      one attempt at that clip. Runs 1..N-1 are your raw answers with no
@@ -17,6 +19,7 @@ Usage:
     python3 lcwo.py report          build the HTML report
     python3 lcwo.py groups          list groups
     python3 lcwo.py trouble         trouble letters, all time
+    python3 lcwo.py user            list operators, add or switch
     python3 lcwo.py selftest        run the built-in checks
 """
 
@@ -319,8 +322,25 @@ def _width_warnings(groups: list[str], label: str = "") -> list[str]:
 SCHEMA = """
 PRAGMA foreign_keys = ON;
 
+-- Who is copying. Every group belongs to one operator, so one database can
+-- hold more than one person's practice without mixing their numbers.
+CREATE TABLE IF NOT EXISTS operators (
+    id          INTEGER PRIMARY KEY,
+    callsign    TEXT NOT NULL UNIQUE,
+    name        TEXT NOT NULL,
+    created_at  TEXT NOT NULL,
+    notes       TEXT
+);
+
+-- small key/value bag; for now only which operator is being recorded for
+CREATE TABLE IF NOT EXISTS settings (
+    key         TEXT PRIMARY KEY,
+    value       TEXT
+);
+
 CREATE TABLE IF NOT EXISTS groups (
     id          INTEGER PRIMARY KEY,
+    operator_id INTEGER REFERENCES operators(id),
     label       TEXT,
     -- mode/speed on a group are only the defaults carried into the next
     -- session; each session records its own, so these may be NULL
@@ -363,7 +383,12 @@ CREATE TABLE IF NOT EXISTS runs (
     deleted_at   TEXT,
     UNIQUE (session_id, seq)
 );
+"""
 
+# Applied after migrate(): an older database has yet to grow the columns these
+# name, so they cannot live in SCHEMA.
+INDEXES = """
+CREATE INDEX IF NOT EXISTS idx_groups_operator ON groups(operator_id);
 CREATE INDEX IF NOT EXISTS idx_sessions_group ON sessions(group_id);
 CREATE INDEX IF NOT EXISTS idx_runs_session ON runs(session_id);
 """
@@ -396,7 +421,9 @@ def connect(path: Path = DB_PATH) -> sqlite3.Connection:
     con.row_factory = sqlite3.Row
     con.executescript(SCHEMA)
     migrate(con)
-    con.executescript(VIEWS)  # after migrate: the views reference deleted_at
+    # both reference columns migrate() may have just added
+    con.executescript(INDEXES)
+    con.executescript(VIEWS)
     return con
 
 
@@ -426,6 +453,7 @@ def migrate(con) -> None:
         ("groups", "deleted_at", "TEXT"),
         ("sessions", "deleted_at", "TEXT"),
         ("runs", "deleted_at", "TEXT"),
+        ("groups", "operator_id", "INTEGER REFERENCES operators(id)"),
     ):
         if col not in cols(table):
             con.execute(f"ALTER TABLE {table} ADD COLUMN {col} {decl}")
@@ -463,21 +491,23 @@ def migrate(con) -> None:
         con.execute("PRAGMA legacy_alter_table=OFF")
         con.execute("PRAGMA foreign_keys=ON")
         con.isolation_level = prev
-    con.executescript(SCHEMA)  # recreate indexes dropped with the old tables
+    con.executescript(INDEXES)  # recreate indexes dropped with the old tables
     bad = con.execute("PRAGMA foreign_key_check").fetchall()
     if bad:
         raise SystemExit(f"migration left dangling references: {bad[:3]}")
 
 
 def create_group(con, mode=None, assignment="", char_wpm=None, eff_wpm=None,
-                 label=None, created_at=None, notes=None, source=None) -> int:
+                 label=None, created_at=None, notes=None, source=None,
+                 operator_id=None) -> int:
     """A group is one homework assignment. Its mode/speed columns are only the
     defaults carried into the next session - each session records its own."""
     label = label or str(assignment)
     cur = con.execute(
-        "INSERT INTO groups (label, mode, assignment, char_wpm, eff_wpm, created_at,"
-        " notes, source) VALUES (?,?,?,?,?,?,?,?)",
-        (label, mode, assignment, char_wpm, eff_wpm, created_at or now_iso(), notes, source),
+        "INSERT INTO groups (operator_id, label, mode, assignment, char_wpm, eff_wpm,"
+        " created_at, notes, source) VALUES (?,?,?,?,?,?,?,?,?)",
+        (operator_id, label, mode, assignment, char_wpm, eff_wpm,
+         created_at or now_iso(), notes, source),
     )
     con.commit()
     return cur.lastrowid
@@ -487,19 +517,125 @@ def fmt_wpm(v) -> str:
     return "?" if v is None else f"{v:g}"
 
 
-def open_groups(con) -> list[sqlite3.Row]:
+# --- operators -------------------------------------------------------------
+#
+# Groups carry an operator_id; sessions and runs inherit it through their
+# group. Which operator is current lives in `settings`, so it survives between
+# invocations and `record` does not have to ask when there is only one.
+
+
+def normalise_call(s) -> str:
+    return re.sub(r"\s+", "", s or "").upper()
+
+
+def create_operator(con, name, callsign, created_at=None, notes=None) -> int:
+    name, callsign = (name or "").strip(), normalise_call(callsign)
+    if not name or not callsign:
+        raise ValueError("an operator needs both a name and a call sign")
+    cur = con.execute(
+        "INSERT INTO operators (callsign, name, created_at, notes) VALUES (?,?,?,?)",
+        (callsign, name, created_at or now_iso(), notes),
+    )
+    con.commit()
+    return cur.lastrowid
+
+
+def list_operators(con) -> list[sqlite3.Row]:
+    return con.execute("SELECT * FROM operators ORDER BY callsign").fetchall()
+
+
+def get_operator(con, oid) -> sqlite3.Row | None:
+    if oid is None:
+        return None
+    return con.execute("SELECT * FROM operators WHERE id=?", (oid,)).fetchone()
+
+
+def find_operator(con, token) -> sqlite3.Row | None:
+    """Look an operator up by id, call sign, or name - however it was typed."""
+    token = str(token or "").strip()
+    if not token:
+        return None
+    if token.isdigit():
+        row = get_operator(con, int(token))
+        if row:
+            return row
     return con.execute(
-        "SELECT * FROM live_groups WHERE closed_at IS NULL ORDER BY created_at DESC"
-    ).fetchall()
+        "SELECT * FROM operators WHERE callsign=? OR lower(name)=lower(?)",
+        (normalise_call(token), token)).fetchone()
 
 
-def last_group(con) -> sqlite3.Row | None:
+def op_label(op) -> str:
+    return "nobody" if op is None else f"{op['name']} ({op['callsign']})"
+
+
+def get_setting(con, key, default=None):
+    row = con.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
+    return default if row is None else row["value"]
+
+
+def set_setting(con, key, value) -> None:
+    con.execute("INSERT INTO settings (key, value) VALUES (?,?)"
+                " ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                (key, None if value is None else str(value)))
+    con.commit()
+
+
+def current_operator(con) -> sqlite3.Row | None:
+    """Who new groups are recorded for, or None if nobody is on file yet."""
+    op = get_operator(con, get_setting(con, "operator_id"))
+    if op is not None:
+        return op
+    ops = list_operators(con)
+    if len(ops) == 1:  # only one candidate: adopt it rather than asking
+        set_current_operator(con, ops[0]["id"])
+        return ops[0]
+    return None
+
+
+def set_current_operator(con, oid) -> None:
+    set_setting(con, "operator_id", oid)
+
+
+def adopt_unassigned(con, oid) -> int:
+    """Hand groups recorded before operators existed to their first owner."""
+    n = con.execute("UPDATE groups SET operator_id=? WHERE operator_id IS NULL",
+                    (oid,)).rowcount
+    con.commit()
+    return n
+
+
+def operator_counts(con, oid) -> tuple[int, int, int]:
+    row = con.execute(
+        "SELECT (SELECT COUNT(*) FROM live_groups WHERE operator_id=?),"
+        "       (SELECT COUNT(*) FROM live_sessions s JOIN live_groups g"
+        "          ON g.id=s.group_id WHERE g.operator_id=?),"
+        "       (SELECT COUNT(*) FROM live_runs r JOIN live_sessions s"
+        "          ON s.id=r.session_id JOIN live_groups g ON g.id=s.group_id"
+        "         WHERE g.operator_id=?)", (oid, oid, oid)).fetchone()
+    return tuple(row)
+
+
+def _owned(oid, alias="") -> tuple[str, tuple]:
+    """WHERE fragment scoping a group query to one operator (None = everyone)."""
+    col = f"{alias}.operator_id" if alias else "operator_id"
+    return ("", ()) if oid is None else (f" AND {col}=?", (oid,))
+
+
+def open_groups(con, oid=None) -> list[sqlite3.Row]:
+    where, params = _owned(oid)
+    return con.execute(
+        "SELECT * FROM live_groups WHERE closed_at IS NULL" + where
+        + " ORDER BY created_at DESC", params).fetchall()
+
+
+def last_group(con, oid=None) -> sqlite3.Row | None:
     """The most recently worked group, open or closed."""
+    where, params = _owned(oid, "g")
     return con.execute(
         "SELECT g.*, COALESCE(MAX(s.started_at), g.created_at) AS activity"
         " FROM live_groups g LEFT JOIN live_sessions s ON s.group_id = g.id"
-        " GROUP BY g.id ORDER BY activity DESC, g.id DESC LIMIT 1"
-    ).fetchone()
+        " WHERE 1=1" + where +
+        " GROUP BY g.id ORDER BY activity DESC, g.id DESC LIMIT 1", params).fetchone()
 
 
 def reopen_group(con, gid) -> None:
@@ -524,8 +660,10 @@ def prune_empty(con) -> tuple[int, int]:
     return ns, ng
 
 
-def all_groups(con) -> list[sqlite3.Row]:
-    return con.execute("SELECT * FROM live_groups ORDER BY created_at").fetchall()
+def all_groups(con, oid=None) -> list[sqlite3.Row]:
+    where, params = _owned(oid)
+    return con.execute("SELECT * FROM live_groups WHERE 1=1" + where
+                       + " ORDER BY created_at", params).fetchall()
 
 
 def get_group(con, gid) -> sqlite3.Row | None:
@@ -731,8 +869,26 @@ def load_group(con, gid) -> GroupView:
     return GroupView(grow, sviews)
 
 
-def load_all(con) -> list[GroupView]:
-    return [load_group(con, g["id"]) for g in all_groups(con)]
+def load_all(con, oid=None) -> list[GroupView]:
+    return [load_group(con, g["id"]) for g in all_groups(con, oid)]
+
+
+def practice_days(views: list[GroupView]) -> list[str]:
+    """Days with at least one graded run, oldest first."""
+    return sorted({r.recorded_at[:10] for v in views for r in v.graded_runs})
+
+
+def char_counts(views: list[GroupView], days=None) -> tuple[Counter, Counter]:
+    """(missed, sent) per character, optionally limited to a set of days."""
+    miss: Counter = Counter()
+    sent: Counter = Counter()
+    for v in views:
+        for s in v.sessions:
+            for r in s.runs:
+                if r.grade and (days is None or r.recorded_at[:10] in days):
+                    miss.update(r.grade.miss_counts())
+                    sent.update(r.grade.sent_counts())
+    return miss, sent
 
 
 def global_miss_counts(views: list[GroupView]) -> Counter:
@@ -755,12 +911,12 @@ def global_miss_counts(views: list[GroupView]) -> Counter:
 KIND_CODE = {"correct": "c", "missed": "m", "wrong": "w", "transposed": "t", "extra": "x"}
 
 
-def report_payload(views: list[GroupView]) -> dict:
+def report_payload(views: list[GroupView], operators=()) -> dict:
     groups, sessions, runs = [], [], []
     for v in views:
         g = v.row
         groups.append({
-            "id": g["id"], "label": g["label"],
+            "id": g["id"], "op": _col(g, "operator_id"), "label": g["label"],
             "mode": dict(MODES).get(g["mode"], g["mode"]),
             "assignment": g["assignment"],
             "charWpm": g["char_wpm"], "effWpm": g["eff_wpm"],
@@ -792,6 +948,8 @@ def report_payload(views: list[GroupView]) -> dict:
         "generated": now_iso(),
         "troubleThreshold": TROUBLE_THRESHOLD,
         "modes": dict(MODES),
+        "operators": [{"id": o["id"], "callsign": o["callsign"], "name": o["name"]}
+                      for o in operators],
         "groups": groups, "sessions": sessions, "runs": runs,
     }
 
@@ -839,6 +997,13 @@ h3{font-size:.8rem;margin:0 0 .6rem;color:var(--muted);
 .quick button[aria-pressed="true"]{background:var(--accent);border-color:var(--accent);color:#fff}
 select{font:inherit;font-size:.85rem;padding:.32rem .5rem;border-radius:7px;
   border:1px solid var(--line);background:var(--panel);color:var(--ink);max-width:100%}
+.filters{display:flex;flex-wrap:wrap;gap:.4rem .8rem;align-items:center;flex:1 1 100%}
+.filters label{display:flex;gap:.3rem;align-items:center;font-size:.76rem;
+  color:var(--muted);text-transform:uppercase;letter-spacing:.04em}
+.filters label[hidden]{display:none}
+#clear{font:inherit;font-size:.8rem;padding:.28rem .65rem;border-radius:7px;
+  border:1px solid var(--line);background:var(--panel);color:var(--muted);cursor:pointer}
+#clear:hover{border-color:var(--accent);color:var(--ink)}
 .scopeline{font-size:.85rem;color:var(--muted);flex:1 1 100%}
 .scopeline b{color:var(--ink)}
 
@@ -870,7 +1035,7 @@ tbody tr.click:hover{background:var(--chip)}
 .pill{display:inline-block;padding:.08rem .45rem;border-radius:999px;font-size:.75rem;font-weight:600}
 .pill.ok{background:var(--okbg);color:var(--ok)}
 .pill.trans{background:var(--transbg);color:var(--trans)}
-.pill.drill{background:var(--chip);color:var(--muted)}
+.pill.drill,.pill.op{background:var(--chip);color:var(--muted)}
 .pill.pending{background:var(--barbg);color:var(--muted)}
 .trouble{display:flex;flex-wrap:wrap;gap:.4rem}
 .tr-chip{display:flex;align-items:baseline;gap:.35rem;background:var(--badbg);color:var(--bad);
@@ -900,7 +1065,15 @@ HTML_SHELL = """<!doctype html>
 <body>
 <div class="bar"><div class="wrap">
   <div class="quick" id="quick"></div>
-  <label>Scope <select id="scope"></select></label>
+  <div class="filters" id="filters">
+    <label>From <select id="f-from"></select></label>
+    <label>To <select id="f-to"></select></label>
+    <label id="w-op" hidden>Operator <select id="f-op"></select></label>
+    <label>Assignment <select id="f-gid"></select></label>
+    <label>Session <select id="f-sid"></select></label>
+    <label id="w-drill" hidden>Drill <select id="f-drill"></select></label>
+    <button id="clear" type="button">Clear</button>
+  </div>
   <div class="scopeline" id="scopeline"></div>
 </div></div>
 <div class="wrap">
@@ -921,6 +1094,7 @@ const TH = DATA.troubleThreshold;
 const MISS = {m:'missed', w:'wrong', t:'transposed'};
 const byId = (a,k) => Object.fromEntries(a.map(x => [x[k], x]));
 const G = byId(DATA.groups, 'id'), S = byId(DATA.sessions, 'id');
+const O = byId(DATA.operators || [], 'id');
 const graded = DATA.runs.filter(r => r.graded);
 const esc = s => String(s == null ? '' : s).replace(/[&<>"]/g,
   c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
@@ -962,43 +1136,70 @@ const trouble = st => [...st.miss.entries()]
 
 /* ---------- scopes ---------- */
 const days = [...new Set(graded.map(r => r.day))].sort();
+/* Windows count days you actually practised, not calendar days: skip a
+   Tuesday and "the last two days" still means your last two sessions' days,
+   which is the question people actually ask of a practice log. */
+const WINDOWS = [2, 3, 7, 14, 30].filter(n => n < days.length);
+const fmtDayShort = d => d ? new Date(d + 'T12:00:00')
+  .toLocaleDateString(undefined, {month:'short', day:'numeric'}) : '-';
 const drills = [...new Set(DATA.sessions.map(s => s.mode).filter(Boolean))].sort();
 const drillOf = r => S[r.sid].mode;
-function scopeRuns(sc){
-  if (sc.t === 'all') return graded;
-  if (sc.t === 'day') return graded.filter(r => r.day === sc.k);
-  if (sc.t === 'group') return graded.filter(r => r.gid === +sc.k);
-  if (sc.t === 'drill') return graded.filter(r => drillOf(r) === sc.k);
-  return graded.filter(r => r.sid === +sc.k);
+const opName = id => O[id] ? `${O[id].name} (${O[id].callsign})` : 'unassigned';
+const opCall = id => O[id] ? O[id].callsign : 'unassigned';
+const opOf = r => G[r.gid].op;
+/* normally one - a report covers a single operator unless built --everyone */
+const ops = [...new Set(DATA.groups.map(g => g.op))].map(String)
+  .sort((a, b) => opName(a).localeCompare(opName(b)));
+/* ---------- the filter ----------
+   Every dimension is independent and they AND together, so "the last two days,
+   letters only" is a combination rather than a scope somebody had to predefine.
+   null means "don't care". */
+const EMPTY = {from:null, to:null, op:null, gid:null, sid:null, drill:null};
+const DIMS = Object.keys(EMPTY);
+const isEmpty = f => DIMS.every(k => f[k] == null);
+
+function filterRuns(f){
+  return graded.filter(r =>
+       (!f.from  || r.day >= f.from)
+    && (!f.to    || r.day <= f.to)
+    && (!f.op    || String(opOf(r)) === String(f.op))
+    && (!f.gid   || r.gid === +f.gid)
+    && (!f.sid   || r.sid === +f.sid)
+    && (!f.drill || drillOf(r) === f.drill));
 }
-function scopeLabel(sc){
-  if (sc.t === 'all') return 'All time';
-  if (sc.t === 'day') return fmtDay(sc.k);
-  if (sc.t === 'group') return G[sc.k].label;
-  if (sc.t === 'drill') return (DATA.modes[sc.k] || sc.k) + ' — every assignment';
-  const s = S[sc.k];
-  return `${G[s.gid].label} · session ${s.seq} · ${s.modeLabel}`;
+
+function filterLabel(f){
+  const bits = [];
+  if (f.from || f.to){
+    const a = f.from || days[0], b = f.to || days[days.length - 1];
+    bits.push(a === b ? fmtDay(a) : `${fmtDay(a)} – ${fmtDay(b)}`);
+  }
+  if (f.op) bits.push(opName(f.op));
+  if (f.sid) bits.push(`${G[S[f.sid].gid].label} · session ${S[f.sid].seq}`);
+  else if (f.gid) bits.push(G[f.gid].label);
+  if (f.drill) bits.push(DATA.modes[f.drill] || f.drill);
+  return bits.length ? bits.join(' · ') : 'All time';
 }
-/* the level below the current one, used for the trouble breakdown columns */
-function children(sc, runs){
-  const key = sc.t === 'group' ? 'sid' : sc.t === 'session' ? 'seq' : 'gid';
-  if (sc.t === 'drill'){
+
+/* The breakdown columns show the level below whatever is pinned: runs inside a
+   session, sessions inside an assignment, otherwise days if the range spans
+   more than one, and assignments if it does not. */
+function children(f, runs){
+  const by = (keyOf, name, short) => {
     const out = new Map();
-    for (const r of runs){ if (!out.has(r.gid)) out.set(r.gid, []); out.get(r.gid).push(r); }
-    return [...out.entries()].map(([k, rs]) =>
-      ({k, name: G[k].label, short: G[k].label, runs: rs}));
-  }
-  const out = new Map();
-  for (const r of runs){
-    const k = r[key];
-    if (!out.has(k)) out.set(k, []);
-    out.get(k).push(r);
-  }
-  const name = k => sc.t === 'group' ? 'S' + S[k].seq
-    : sc.t === 'session' ? 'R' + k : G[k].label.replace(/ · .*/, '');
-  const short = k => sc.t === 'group' ? 'S' + S[k].seq
-    : sc.t === 'session' ? 'R' + k : 'G' + k;
-  return [...out.entries()].map(([k, rs]) => ({k, name: name(k), short: short(k), runs: rs}));
+    for (const r of runs){
+      const k = keyOf(r);
+      if (!out.has(k)) out.set(k, []);
+      out.get(k).push(r);
+    }
+    return [...out.entries()]
+      .sort((a, b) => String(a[0]).localeCompare(String(b[0]), undefined, {numeric:true}))
+      .map(([k, rs]) => ({k, name: name(k), short: short(k), runs: rs}));
+  };
+  if (f.sid) return by(r => r.seq, k => 'Run ' + k, k => 'R' + k);
+  if (f.gid) return by(r => r.sid, k => 'Session ' + S[k].seq, k => 'S' + S[k].seq);
+  if (new Set(runs.map(r => r.day)).size > 1) return by(r => r.day, fmtDay, fmtDayShort);
+  return by(r => r.gid, k => G[k].label, k => G[k].label.replace(/ · .*/, ''));
 }
 
 /* ---------- render helpers ---------- */
@@ -1013,7 +1214,7 @@ const table = (head, rows) => rows.length
   ? `<div class="scroll"><table><thead><tr>${head}</tr></thead>
      <tbody>${rows.join('')}</tbody></table></div>` : '';
 
-function sparkline(sc, runs){
+function sparkline(f, runs){
   if (runs.length < 2) return '';
   const pts = runs.map(r => stats([r]).pctRight);
   const w = 640, h = 96, pad = 16;
@@ -1021,8 +1222,8 @@ function sparkline(sc, runs){
   const step = (w - 2 * pad) / (pts.length - 1);
   const xy = pts.map((v, i) => [pad + i * step, pad + (100 - v) / span * (h - 2 * pad - 10)]);
   const d = xy.map(([x, y], i) => `${i ? 'L' : 'M'}${x.toFixed(1)},${y.toFixed(1)}`).join(' ');
-  const lbl = runs.map(r => sc.t === 'session' ? 'R' + r.seq
-    : `S${S[r.sid].seq}R${r.seq}`);  // scope decides how much context each tick needs
+  const lbl = runs.map(r => f.sid ? 'R' + r.seq
+    : `S${S[r.sid].seq}R${r.seq}`);  // how much context a tick needs
   // Per-point labels collide badly past a handful of runs, so only the two ends
   // are drawn; everything else is on hover, reported in the caption above.
   const ends = [0, xy.length - 1].map(i => `<text x="${xy[i][0].toFixed(1)}" y="${h - 2}"
@@ -1082,14 +1283,14 @@ function panelHeadline(runs, st){
     ${tile(trouble(st).length, 'trouble letters')}</div>`;
 }
 
-function panelPractice(sc, runs, st){
+function panelPractice(f, runs, st){
   const tr = trouble(st);
   const chips = tr.length
     ? `<div class="trouble">${tr.map(([c, m]) =>
         `<span class="tr-chip">${esc(c)}<small>&times;${m.total}</small></span>`).join('')}</div>`
     : `<p class="none">nothing missed ${TH}+ times in this scope.</p>`;
 
-  const kids = children(sc, runs);
+  const kids = children(f, runs);
   const showKids = tr.length && kids.length > 1;
   const kidStats = showKids ? kids.map(k => ({...k, st: stats(k.runs)})) : [];
   const head = `<th>Char</th>${kidStats.map(k =>
@@ -1115,8 +1316,8 @@ function panelPractice(sc, runs, st){
   </div>`;
 }
 
-function panelProgress(sc, runs){
-  const spark = sparkline(sc, runs);
+function panelProgress(f, runs){
+  const spark = sparkline(f, runs);
   if (!spark) return '';
   const pts = runs.map(r => stats([r]).pctRight);
   const cap = `${runs.length} runs · ${pts[0].toFixed(1)}% → ${pts[pts.length - 1].toFixed(1)}%`
@@ -1126,18 +1327,19 @@ function panelProgress(sc, runs){
     ${spark}</div>`;
 }
 
-function panelRuns(sc, runs){
+function panelRuns(f, runs){
   const anyTrans = runs.some(r => r.cells.some(([, , k]) => k.includes('t')));
   const rows = runs.map((r, i) => {
     const st = stats([r]);
     const s = S[r.sid];
-    const drill = sc.t === 'drill' || drills.length < 2 ? ''
+    const drill = f.drill || drills.length < 2 ? ''
       : ` <span class="pill drill">${esc(s.modeLabel)}</span>`;
-    const where = sc.t === 'session' ? `Run ${r.seq}`
+    const who = f.op || ops.length < 2 ? ''
+      : ` <span class="pill op">${esc(opCall(G[r.gid].op))}</span>`;
+    const where = f.sid ? `Run ${r.seq}`
       : `S${s.seq} R${r.seq}`
-        + (sc.t === 'all' || sc.t === 'day' || sc.t === 'drill'
-           ? ` <span class="pill pending">${esc(G[r.gid].label)}</span>` : '')
-        + drill;
+        + (f.gid ? '' : ` <span class="pill pending">${esc(G[r.gid].label)}</span>`)
+        + drill + who;
     const missed = [...stats([r]).miss.keys()].sort().join(' ');
     return `<tr class="click" data-run="${i}">
       <td>${where} ${r.final ? '<span class="pill trans">final</span>' : ''}</td>
@@ -1201,19 +1403,21 @@ function panelChars(st){
     </details></div>`;
 }
 
-function panelContext(sc, runs){
-  // only a group or a session maps onto one assignment's settings
-  if (sc.t !== 'group' && sc.t !== 'session') return '';
-  const g = sc.t === 'group' ? G[sc.k] : G[S[sc.k].gid];
-  const mine = DATA.sessions.filter(x => sc.t === 'group'
-    ? x.gid === +sc.k : x.id === +sc.k);
+function panelContext(f, runs){
+  // only one assignment (or one session of it) maps onto one set of settings
+  const gid = f.sid ? S[f.sid].gid : f.gid;
+  if (!gid) return '';
+  const g = G[gid];
+  const mine = DATA.sessions.filter(x => f.sid ? x.id === +f.sid : x.gid === +gid);
   const uniq = a => [...new Set(a)].join(', ') || '-';
-  const bits = [`<span>Assignment <b>${esc(g.assignment)}</b></span>`,
+  const bits = [
+    ...(ops.length > 1 ? [`<span>Operator <b>${esc(opName(g.op))}</b></span>`] : []),
+    `<span>Assignment <b>${esc(g.assignment)}</b></span>`,
     `<span>Drill <b>${esc(uniq(mine.map(x => x.modeLabel)))}</b></span>`,
     `<span>Speed <b>${esc(uniq(mine.map(x => x.charWpm == null ? 'not recorded'
       : `${+x.charWpm}/${+x.effWpm} wpm`)))}</b></span>`];
-  const note = sc.t === 'session' ? S[sc.k].notes : g.notes;
-  return `<div class="panel"><h3>About this ${sc.t}</h3>
+  const note = f.sid ? S[f.sid].notes : g.notes;
+  return `<div class="panel"><h3>About this ${f.sid ? 'session' : 'assignment'}</h3>
     <div class="scopeline" style="flex:1">${bits.join(' &middot; ')}</div>
     ${note ? `<div class="note">${esc(note)}</div>` : ''}</div>`;
 }
@@ -1221,73 +1425,148 @@ function panelContext(sc, runs){
 
 APP_JS3 = r"""
 /* ---------- controller ---------- */
-let sc = {t:'all', k:null};
+let F = {...EMPTY};
 
-function buildScopeSelect(){
-  const sel = document.getElementById('scope');
-  const opt = (v, label, n) => `<option value="${v}">${esc(label)} (${n} run${n === 1 ? '' : 's'})</option>`;
-  let h = opt('all', 'All time', graded.length);
-  if (days.length > 1){
-    h += '<optgroup label="By day">';
-    for (const d of [...days].reverse())
-      h += opt('day:' + d, fmtDay(d), graded.filter(r => r.day === d).length);
-    h += '</optgroup>';
-  }
-  h += '<optgroup label="By group">';
+const ctl = k => document.getElementById('f-' + k);
+
+function buildControls(){
+  const opt = (v, label, n, cur) =>
+    `<option value="${esc(v)}"${String(cur ?? '') === String(v) ? ' selected' : ''}>`
+    + `${esc(label)}${n == null ? '' : ` (${n})`}</option>`;
+  /* Counts are computed with that one dimension replaced, so a choice that
+     would empty the page says so before you pick it. */
+  const n = over => filterRuns({...F, ...over}).length;
+
+  let h = opt('', 'Earliest', null, F.from);
+  for (const d of days) h += opt(d, fmtDay(d), null, F.from);
+  ctl('from').innerHTML = h;
+
+  h = opt('', 'Latest', null, F.to);
+  for (const d of [...days].reverse()) h += opt(d, fmtDay(d), null, F.to);
+  ctl('to').innerHTML = h;
+
+  h = opt('', 'Everyone', n({op:null}), F.op);
+  for (const o of ops) h += opt(o, opName(o), n({op:o}), F.op);
+  ctl('op').innerHTML = h;
+  document.getElementById('w-op').hidden = ops.length < 2;
+
+  h = opt('', 'All assignments', n({gid:null, sid:null}), F.gid);
   for (const g of [...DATA.groups].reverse())
-    h += opt('group:' + g.id, g.label, graded.filter(r => r.gid === g.id).length);
-  h += '</optgroup>';
-  if (drills.length > 1){
-    h += '<optgroup label="By drill">';
-    for (const d of drills)
-      h += opt('drill:' + d, DATA.modes[d] || d,
-               graded.filter(r => drillOf(r) === d).length);
-    h += '</optgroup>';
-  }
-  h += '<optgroup label="By session">';
+    h += opt(g.id, g.label, n({gid:g.id, sid:null}), F.gid);
+  ctl('gid').innerHTML = h;
+
+  // sessions cascade off the assignment, and drop out when nothing is left
+  h = opt('', 'All sessions', n({sid:null}), F.sid);
   for (const s of [...DATA.sessions].reverse()){
-    const n = graded.filter(r => r.sid === s.id).length;
-    if (n) h += opt('session:' + s.id, `${G[s.gid].label} · session ${s.seq}`, n);
+    if (F.gid && s.gid !== +F.gid) continue;
+    const c = n({sid:s.id});
+    if (c || String(F.sid) === String(s.id))
+      h += opt(s.id, `${F.gid ? '' : G[s.gid].label + ' · '}session ${s.seq}`, c, F.sid);
   }
-  h += '</optgroup>';
-  sel.innerHTML = h;
-  sel.onchange = () => {
-    const [t, k] = sel.value.split(':');
-    setScope({t, k: k ?? null});
+  ctl('sid').innerHTML = h;
+
+  h = opt('', 'All drills', n({drill:null}), F.drill);
+  for (const d of drills) h += opt(d, DATA.modes[d] || d, n({drill:d}), F.drill);
+  ctl('drill').innerHTML = h;
+  document.getElementById('w-drill').hidden = drills.length < 2;
+}
+
+function wireControls(){
+  for (const k of DIMS) ctl(k).onchange = () => {
+    const v = ctl(k).value || null;
+    const next = {...F, [k]: v};
+    // keep the combination coherent rather than silently empty
+    if (k === 'gid' && next.sid && S[next.sid] && String(S[next.sid].gid) !== String(v))
+      next.sid = null;
+    if (k === 'sid' && v) next.gid = String(S[v].gid);
+    if (k === 'from' && v && next.to && v > next.to) next.to = null;
+    if (k === 'to' && v && next.from && v < next.from) next.from = null;
+    setFilter(next);
   };
+  document.getElementById('clear').onclick = () => setFilter({...EMPTY});
 }
 
 function buildQuick(){
   const last = graded[graded.length - 1];
-  const items = [['All time', {t:'all', k:null}]];
-  if (days.length > 1)
-    items.push([fmtDay(days[days.length - 1]), {t:'day', k:days[days.length - 1]}]);
+  const items = [['All time', {...EMPTY}]];
+  if (days.length > 1){
+    const d = days[days.length - 1];
+    items.push([fmtDay(d), {...EMPTY, from:d, to:d}]);
+  }
+  for (const w of WINDOWS.filter(w => w === 2 || w === 7))
+    items.push([`Last ${w} days`, {...EMPTY, from: days[days.length - w]}]);
   if (last){
-    items.push(['Latest group', {t:'group', k:String(last.gid)}]);
-    items.push(['Latest session', {t:'session', k:String(last.sid)}]);
+    items.push(['Latest assignment', {...EMPTY, gid: String(last.gid)}]);
+    items.push(['Latest session',
+                {...EMPTY, gid: String(S[last.sid].gid), sid: String(last.sid)}]);
   }
   document.getElementById('quick').innerHTML = items.map(([l, s], i) =>
     `<button data-i="${i}">${esc(l)}</button>`).join('');
   document.querySelectorAll('#quick button').forEach(b => {
-    b.onclick = () => setScope(items[+b.dataset.i][1]);
+    b.onclick = () => setFilter(items[+b.dataset.i][1]);
   });
   return items;
 }
 
-function setScope(next){
-  sc = next;
-  const val = sc.t === 'all' ? 'all' : `${sc.t}:${sc.k}`;
-  document.getElementById('scope').value = val;
+/* ---------- the URL carries the whole filter ---------- */
+function hashOf(f){
+  const parts = DIMS.filter(k => f[k] != null && f[k] !== '')
+    .map(k => `${k}=${encodeURIComponent(f[k])}`);
+  return parts.length ? '#' + parts.join('&') : '#all';
+}
+
+function validFilter(f){
+  return (!f.from || days.includes(f.from))
+    && (!f.to || days.includes(f.to))
+    && (!f.op || ops.includes(String(f.op)))
+    && (!f.gid || !!G[f.gid])
+    && (!f.sid || !!S[f.sid])
+    && (!f.drill || drills.includes(f.drill));
+}
+
+function filterFromHash(){
+  const raw = (location.hash || '').slice(1);
+  if (!raw) return null;
+  if (raw === 'all') return {...EMPTY};
+  if (raw.includes('=')){
+    const f = {...EMPTY};
+    let any = false;
+    for (const part of raw.split('&')){
+      const [k, v] = part.split('=');
+      if (!DIMS.includes(k) || !v) continue;
+      f[k] = decodeURIComponent(v);
+      any = true;
+    }
+    return any && validFilter(f) ? f : null;
+  }
+  // links written before the filter bar existed: #group:8, #day:2026-09-10
+  const [t, k] = raw.split(':');
+  if (!t || !k) return null;
+  const legacy = {
+    day: () => ({from:k, to:k}),
+    group: () => ({gid:k}),
+    session: () => S[k] ? {gid:String(S[k].gid), sid:k} : null,
+    drill: () => ({drill:k}),
+    operator: () => ({op:k}),
+    last: () => days.length > +k ? {from: days[days.length - +k]} : null,
+  };
+  const made = legacy[t] && legacy[t]();
+  const f = made && {...EMPTY, ...made};
+  return f && validFilter(f) ? f : null;
+}
+
+function setFilter(next){
+  F = {...EMPTY, ...next};
+  buildControls();
   document.querySelectorAll('#quick button').forEach((b, i) => {
-    const s = QUICK[i][1];
-    b.setAttribute('aria-pressed', String(s.t === sc.t && String(s.k) === String(sc.k)));
+    b.setAttribute('aria-pressed', String(hashOf(QUICK[i][1]) === hashOf(F)));
   });
-  try { history.replaceState(null, '', '#' + val); } catch (e) {}
+  try { history.replaceState(null, '', hashOf(F)); } catch (e) {}
   render();
 }
 
 function render(){
-  const runs = scopeRuns(sc);
+  const runs = filterRuns(F);
   const st = stats(runs);
   const sess = new Set(runs.map(r => r.sid)).size;
   const grps = new Set(runs.map(r => r.gid)).size;
@@ -1295,14 +1574,17 @@ function render(){
   const span = dys.length > 1 ? `${fmtDay(dys[0])} – ${fmtDay(dys[dys.length - 1])}`
     : fmtDay(dys[0]);
   document.getElementById('scopeline').innerHTML =
-    `<b>${esc(scopeLabel(sc))}</b> — ${grps} group${grps === 1 ? '' : 's'},
+    `<b>${esc(filterLabel(F))}</b> — ${grps} group${grps === 1 ? '' : 's'},
      ${sess} session${sess === 1 ? '' : 's'}, ${runs.length} run${runs.length === 1 ? '' : 's'}
      · ${esc(span)}`;
 
   const app = document.getElementById('app');
-  if (!runs.length){ app.innerHTML = '<p class="none">No graded runs in this scope.</p>'; return; }
-  app.innerHTML = panelHeadline(runs, st) + panelPractice(sc, runs, st)
-    + panelProgress(sc, runs) + panelRuns(sc, runs) + panelChars(st) + panelContext(sc, runs);
+  if (!runs.length){
+    app.innerHTML = '<p class="none">No graded runs match these filters.</p>';
+    return;
+  }
+  app.innerHTML = panelHeadline(runs, st) + panelPractice(F, runs, st)
+    + panelProgress(F, runs) + panelRuns(F, runs) + panelChars(st) + panelContext(F, runs);
 
   app.querySelectorAll('tr.click').forEach(tr => {
     tr.onclick = () => {
@@ -1324,35 +1606,28 @@ function render(){
 }
 
 document.getElementById('sub').textContent =
-  `${DATA.groups.length} group(s), ${DATA.sessions.length} session(s), `
+  (ops.length === 1 && O[ops[0]] ? opName(ops[0]) + ' · ' : '')
+  + `${DATA.groups.length} group(s), ${DATA.sessions.length} session(s), `
   + `${graded.length} graded run(s) · generated `
   + new Date(DATA.generated).toLocaleString();
 
-buildScopeSelect();
+wireControls();
 const QUICK = buildQuick();
-function scopeFromHash(){
-  const [t, k] = (location.hash || '').slice(1).split(':');
-  if (t === 'all') return {t:'all', k:null};
-  if (!t || !k) return null;
-  const known = t === 'day' ? days.includes(k)
-    : t === 'group' ? !!G[k] : t === 'session' ? !!S[k]
-    : t === 'drill' ? drills.includes(k) : false;
-  return known ? {t, k} : null;
-}
-setScope(scopeFromHash() || {t:'all', k:null});
+setFilter(filterFromHash() || {...EMPTY});
 
-// following a #group:8 link into a tab that already has the report open would
-// otherwise change the URL and nothing else
+// following a link into a tab that already has the report open would otherwise
+// change the URL and nothing else
 if (typeof window !== 'undefined' && window.addEventListener)
   window.addEventListener('hashchange', () => {
-    const next = scopeFromHash();
-    if (next && !(next.t === sc.t && String(next.k) === String(sc.k))) setScope(next);
+    const next = filterFromHash();
+    if (next && hashOf(next) !== hashOf(F)) setFilter(next);
   });
 """
 
 
-def build_report(views: list[GroupView], title: str = "LCWO progress") -> str:
-    payload = json.dumps(report_payload(views), separators=(",", ":"))
+def build_report(views: list[GroupView], title: str = "LCWO progress",
+                 operators=()) -> str:
+    payload = json.dumps(report_payload(views, operators), separators=(",", ":"))
     payload = payload.replace("<", "\\u003c")  # never break out of the script tag
     return (HTML_SHELL
             .replace("__TITLE__", escape(title))
@@ -1361,14 +1636,25 @@ def build_report(views: list[GroupView], title: str = "LCWO progress") -> str:
             .replace("__DATA__", payload))
 
 
-def write_report(con, gid: int | None = None, out: Path | None = None) -> Path:
-    views = [load_group(con, gid)] if gid else load_all(con)
+def write_report(con, gid: int | None = None, out: Path | None = None,
+                 oid: int | None = None) -> Path:
+    if gid:
+        views = [load_group(con, gid)]
+        oid = _col(views[0].row, "operator_id")  # a group implies its operator
+    else:
+        views = load_all(con, oid)
     if not views:
         raise SystemExit("no data yet - record a session first")
+    op, ops = get_operator(con, oid), list_operators(con)
     title = f"LCWO group {gid}" if gid else "LCWO progress"
-    html = build_report(views, title)
-    REPORT_DIR.mkdir(parents=True, exist_ok=True)
-    out = out or REPORT_DIR / (f"group-{gid}.html" if gid else "index.html")
+    if op is not None:
+        title += f" \u2014 {op['callsign']}"
+    html = build_report(views, title, ops)
+    # once more than one operator is on file each gets their own report tree,
+    # so switching operators cannot overwrite someone else's page
+    base = REPORT_DIR / op["callsign"].lower() if op and len(ops) > 1 else REPORT_DIR
+    out = out or base / (f"group-{gid}.html" if gid else "index.html")
+    out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(html, encoding="utf-8")
     return out
 
@@ -1617,8 +1903,68 @@ def group_line(con, g) -> str:
             f" · {group_speeds(con, g['id'])} · {state}")
 
 
-def choose_group(con):
-    rows = all_groups(con)
+def add_operator(con, adopt=False):
+    """Ask for a name and a call sign, and make that operator current."""
+    rule("Who is copying?")
+    print(dim("  recorded with every group, so one database can hold more"
+              " than one operator"))
+    name = ask_text("Name")
+    while True:
+        call = normalise_call(ask_text("Call sign"))
+        if not call:
+            print(dim("  (required)"))
+            continue
+        if find_operator(con, call) is not None:
+            print(red(f"  {call} is already in the database"))
+            continue
+        break
+    oid = create_operator(con, name, call)
+    set_current_operator(con, oid)
+    if adopt:
+        n = adopt_unassigned(con, oid)
+        if n:
+            print(dim(f"  {n} existing group(s) now belong to {call}"))
+    print(green(f"\n  ✓ recording as {name} ({call})"))
+    return get_operator(con, oid)
+
+
+def choose_operator(con, token=None):
+    """Who the next group/session is for. Only asks when there is a choice."""
+    if token:
+        op = find_operator(con, token)
+        if op is None:
+            raise SystemExit(f"no operator matching {token!r}"
+                             " - add one with `python3 lcwo.py user --add`")
+        set_current_operator(con, op["id"])
+        return op
+
+    ops = list_operators(con)
+    if not ops:
+        # first run, or a database from before operators existed
+        return add_operator(con, adopt=True)
+
+    cur = current_operator(con)
+    if len(ops) == 1:
+        print(dim(f"  recording as {op_label(ops[0])}"
+                  "   (change with `lcwo user --add` / `--use`)"))
+        return ops[0]
+
+    rule("Operator")
+    opts = [(str(o["id"]), op_label(o)) for o in ops]
+    opts.append(("new", "Add a new operator"))
+    default = next((i for i, o in enumerate(ops, 1)
+                    if cur and o["id"] == cur["id"]), 1)
+    pick = ask_choice("Who is copying?", opts, default=default)
+    if pick == "new":
+        return add_operator(con)
+    op = get_operator(con, int(pick))
+    set_current_operator(con, op["id"])
+    return op
+
+
+def choose_group(con, op=None):
+    oid = op["id"] if op else None
+    rows = all_groups(con, oid)
     rule("All groups")
     for g in rows:
         print(f"  {g['id']:>3}) {g['label']:<28} {dim(group_line(con, g))}")
@@ -1628,13 +1974,16 @@ def choose_group(con):
             return None
         if v.isdigit() and any(int(v) == g["id"] for g in rows):
             return get_group(con, int(v))
+        if v.isdigit() and op is not None:
+            print(dim(f"  (group {v} is not {op['callsign']}'s)"))
         print(dim("  (pick an id from the list, or press Enter for a new group)"))
 
 
-def pick_group(con):
-    last = last_group(con)
+def pick_group(con, op=None):
+    oid = op["id"] if op else None
+    last = last_group(con, oid)
     if last is None:
-        return new_group(con)
+        return new_group(con, op)
 
     rule("Resume or start new")
     print(f"  most recent:  {bold(last['label'])}  {dim('(group ' + str(last['id']) + ')')}")
@@ -1654,16 +2003,16 @@ def pick_group(con):
             print(dim(f"  reopened group {last['id']}"))
         return get_group(con, last["id"])
     if choice == "other":
-        picked = choose_group(con)
+        picked = choose_group(con, op)
         if picked is not None:
             if picked["closed_at"]:
                 reopen_group(con, picked["id"])
                 print(dim(f"  reopened group {picked['id']}"))
             return get_group(con, picked["id"])
-    return new_group(con)
+    return new_group(con, op)
 
 
-def new_group(con):
+def new_group(con, op=None):
     """A group is one homework assignment. Drill and speed are asked per
     session, because a single assignment alternates copy and send and can
     change drill partway through."""
@@ -1671,7 +2020,8 @@ def new_group(con):
         rule("New assignment")
         assignment = ask_text("Assignment (e.g. S2HW3)")
         if ask_yes_no(f"   start assignment {bold(assignment)}?", True):
-            gid = create_group(con, assignment=assignment, label=assignment)
+            gid = create_group(con, assignment=assignment, label=assignment,
+                               operator_id=op["id"] if op else None)
             print(green(f"\n  ✓ group {gid} created for {assignment}"))
             return get_group(con, gid)
         print(dim("  starting over\n"))
@@ -1706,8 +2056,10 @@ def cmd_record(args) -> int:
         print(dim(f"  cleared {ns} empty session(s) and {ng} empty group(s) "
                   "left by an earlier run"))
     grp = None
+    op = None
     try:
-        grp = pick_group(con)
+        op = choose_operator(con, getattr(args, "user", None))
+        grp = pick_group(con, op)
         while True:
             mode, cw, ew = session_settings(con, grp)
             sess = start_session(con, grp, mode=mode, char_wpm=cw, eff_wpm=ew)
@@ -1738,8 +2090,14 @@ def cmd_record(args) -> int:
         prune_empty(con)
         try:
             still_there = grp is not None and get_group(con, grp["id"]) is not None
-            if con.execute("SELECT COUNT(*) FROM live_runs").fetchone()[0]:
-                out = write_report(con)
+            oid = op["id"] if op else None
+            recorded = con.execute(
+                "SELECT COUNT(*) FROM live_runs r"
+                " JOIN live_sessions s ON s.id = r.session_id"
+                " JOIN live_groups g ON g.id = s.group_id"
+                " WHERE (? IS NULL OR g.operator_id = ?)", (oid, oid)).fetchone()[0]
+            if recorded:
+                out = write_report(con, oid=oid)
                 print(green(f"\n  ✓ report: {out}"))
                 if still_there:
                     print(green(f"  ✓ group:  {write_report(con, grp['id'])}"))
@@ -1748,7 +2106,7 @@ def cmd_record(args) -> int:
                     # widen to all time from there
                     url = out.resolve().as_uri()
                     if still_there:
-                        url += f"#group:{grp['id']}"
+                        url += f"#gid={grp['id']}"
                     webbrowser.open(url)
         except (Abort, KeyboardInterrupt):
             pass
@@ -1761,13 +2119,30 @@ def cmd_record(args) -> int:
 # --------------------------------------------------------------------------
 
 
+def scope_operator(con, args, persist=False):
+    """Which operator a command applies to: --user, else whoever is current."""
+    tok = getattr(args, "user", None)
+    if tok:
+        op = find_operator(con, tok)
+        if op is None:
+            raise SystemExit(f"no operator matching {tok!r}"
+                             " - see `python3 lcwo.py user`")
+        if persist:
+            set_current_operator(con, op["id"])
+        return op
+    if getattr(args, "everyone", False):
+        return None
+    return current_operator(con)
+
+
 def cmd_groups(args) -> int:
     con = connect()
-    views = load_all(con)
+    op = scope_operator(con, args)
+    views = load_all(con, op["id"] if op else None)
     if not views:
         print(dim("no groups yet — run `python3 lcwo.py` to start one"))
         return 0
-    rule("Groups")
+    rule(f"Groups — {op_label(op)}" if op else "Groups — everyone")
     print(f"  {'id':>3}  {'assignment':<12} {'drills':<26} {'sess':>4} {'runs':>4} "
           f"{'wrong':>6}  trouble")
     for v in views:
@@ -1786,13 +2161,18 @@ def cmd_groups(args) -> int:
 
 def cmd_trouble(args) -> int:
     con = connect()
-    views = [load_group(con, args.group)] if args.group else load_all(con)
-    counts = global_miss_counts(views)
-    sent: Counter = Counter()
-    for v in views:
-        sent.update(v.sent_counts())
+    op = scope_operator(con, args)
+    views = ([load_group(con, args.group)] if args.group
+             else load_all(con, op["id"] if op else None))
+    window = practice_days(views)[-args.days:] if args.days else None
+    counts, sent = char_counts(views, window)
     tr = trouble_from(counts, args.threshold)
     scope = f"group {args.group}" if args.group else "all time"
+    if window:
+        scope = (f"last {len(window)} practice day(s), "
+                 f"{fmt_ts(window[0])[:10]} to {fmt_ts(window[-1])[:10]}")
+    if op and not args.group:
+        scope += f" · {op['callsign']}"
     rule(f"Trouble letters — {scope} (missed {args.threshold}+ times)")
     if not tr:
         print(dim("  none yet"))
@@ -1805,9 +2185,89 @@ def cmd_trouble(args) -> int:
     return 0
 
 
+def list_users(con) -> None:
+    ops = list_operators(con)
+    if not ops:
+        print(dim('no operators yet — python3 lcwo.py user --add'))
+        return
+    cur = current_operator(con)
+    rule("Operators")
+    print(f"      {'id':>3}  {'call':<10} {'name':<22} {'grp':>4} {'sess':>5} {'runs':>5}")
+    for o in ops:
+        ng, nsess, nruns = operator_counts(con, o["id"])
+        mark = green(" >") if cur and o["id"] == cur["id"] else "  "
+        print(f"  {mark}  {o['id']:>3}  {o['callsign']:<10} {o['name'][:22]:<22}"
+              f" {ng:>4} {nsess:>5} {nruns:>5}")
+    loose = con.execute(
+        "SELECT COUNT(*) FROM live_groups WHERE operator_id IS NULL").fetchone()[0]
+    if loose:
+        print(yellow(f"\n  {loose} group(s) belong to nobody"
+                     " — `python3 lcwo.py user --add` adopts them"))
+    print(dim("\n  switch with:  python3 lcwo.py user --use CALL"))
+
+
+def cmd_user(args) -> int:
+    """Show who is on file, add an operator, switch, rename, or remove one."""
+    con = connect()
+    if args.add:
+        name = args.name or (ask_text("Name") if _TTY else "")
+        call = args.call or (ask_text("Call sign") if _TTY else "")
+        if not (name or "").strip() or not normalise_call(call):
+            raise SystemExit("an operator needs both --name and --call")
+        if find_operator(con, call) is not None:
+            raise SystemExit(f"{normalise_call(call)} is already in the database")
+        first = not list_operators(con)
+        oid = create_operator(con, name, call)
+        set_current_operator(con, oid)
+        if first:
+            n = adopt_unassigned(con, oid)
+            if n:
+                print(dim(f"  {n} existing group(s) now belong to {normalise_call(call)}"))
+        print(green(f"  ✓ added {op_label(get_operator(con, oid))}, now recording as them"))
+    elif args.use:
+        op = find_operator(con, args.use)
+        if op is None:
+            raise SystemExit(f"no operator matching {args.use!r}")
+        set_current_operator(con, op["id"])
+        print(green(f"  ✓ recording as {op_label(op)}"))
+    elif args.remove:
+        op = find_operator(con, args.remove)
+        if op is None:
+            raise SystemExit(f"no operator matching {args.remove!r}")
+        held = con.execute("SELECT COUNT(*) FROM groups WHERE operator_id=?",
+                           (op["id"],)).fetchone()[0]
+        if held:
+            raise SystemExit(f"{op['callsign']} still owns {held} group(s)"
+                             " — bin and purge those first")
+        con.execute("DELETE FROM operators WHERE id=?", (op["id"],))
+        cur = get_setting(con, "operator_id")
+        if cur is not None and int(cur) == op["id"]:
+            set_current_operator(con, None)
+        con.commit()
+        print(green(f"  ✓ removed {op_label(op)}"))
+    elif args.name or args.call:
+        op = current_operator(con)
+        if op is None:
+            raise SystemExit("nobody is current — add one with --add")
+        name = (args.name or op["name"]).strip()
+        call = normalise_call(args.call) or op["callsign"]
+        clash = find_operator(con, call)
+        if clash is not None and clash["id"] != op["id"]:
+            raise SystemExit(f"{call} is already in the database")
+        con.execute("UPDATE operators SET name=?, callsign=? WHERE id=?",
+                    (name, call, op["id"]))
+        con.commit()
+        print(green(f"  ✓ {op_label(op)} is now {name} ({call})"))
+    list_users(con)
+    con.close()
+    return 0
+
+
 def cmd_report(args) -> int:
     con = connect()
-    out = write_report(con, args.group, Path(args.out) if args.out else None)
+    op = scope_operator(con, args)
+    out = write_report(con, args.group, Path(args.out) if args.out else None,
+                       oid=op["id"] if op else None)
     print(green(f"  ✓ {out}"))
     if args.open:
         webbrowser.open(out.resolve().as_uri())
@@ -1818,9 +2278,12 @@ def cmd_report(args) -> int:
 def cmd_key(args) -> int:
     """Attach a results table to a session that was left ungraded."""
     con = connect()
+    op = scope_operator(con, args)
+    oid = op["id"] if op else None
     pending = con.execute(
         "SELECT s.*, g.label FROM live_sessions s JOIN live_groups g ON g.id = s.group_id"
-        " WHERE s.key_json IS NULL ORDER BY s.started_at"
+        " WHERE s.key_json IS NULL AND (? IS NULL OR g.operator_id = ?)"
+        " ORDER BY s.started_at", (oid, oid)
     ).fetchall()
     if not pending:
         print(dim("no ungraded sessions"))
@@ -1866,14 +2329,18 @@ def cmd_speed(args) -> int:
     """Fill in the speed for groups whose source note never recorded one."""
     con = connect()
     if args.char is None and args.eff is None:  # nothing to set: just report
-        sql = "SELECT id, label, char_wpm, eff_wpm FROM live_groups"
-        params = ()
-        if args.group is not None:
-            sql += " WHERE id=?"
-            params = (args.group,)
+        if args.group is not None:  # an explicit id outranks the operator filter
+            sql, params = "SELECT id, label, char_wpm, eff_wpm FROM live_groups WHERE id=?", (args.group,)
+        else:
+            op = scope_operator(con, args)
+            oid = op["id"] if op else None
+            sql = ("SELECT id, label, char_wpm, eff_wpm FROM live_groups"
+                   " WHERE (? IS NULL OR operator_id = ?)")
+            params = (oid, oid)
         rows = con.execute(sql + " ORDER BY created_at", params).fetchall()
         if not rows:
-            raise SystemExit(f"no such group: {args.group}")
+            raise SystemExit(f"no such group: {args.group}" if args.group is not None
+                             else "no groups yet")
         rule("Speeds")
         for r in rows:
             known = r["char_wpm"] is not None
@@ -1904,9 +2371,12 @@ def merge_plan(con) -> list[dict]:
     rows = con.execute("SELECT * FROM live_groups ORDER BY created_at, id").fetchall()
     buckets: dict[str, list] = {}
     for g in rows:
-        buckets.setdefault((g["assignment"] or "").strip().upper(), []).append(g)
+        # keyed by operator too: two people can both have an S1HW1
+        buckets.setdefault(
+            (_col(g, "operator_id"), (g["assignment"] or "").strip().upper()), []
+        ).append(g)
     plan = []
-    for key, gs in buckets.items():
+    for (_oid, key), gs in buckets.items():
         if not key:
             continue
         target, rest = gs[0], gs[1:]
@@ -2227,7 +2697,8 @@ def cmd_selftest(args) -> int:
         check("earlier run graded retroactively", v.sessions[0].runs[0].grade is not None)
         check("R missed twice -> trouble", dict(v.trouble()).get("R", 0) >= 2)
         html = build_report([v])
-        check("html builds", 'id="scope"' in html and 'id="data"' in html)
+        check("html builds", 'id="f-from"' in html and 'id="f-drill"' in html
+              and 'id="data"' in html)
         blob = re.search(r'<script id="data"[^>]*>(.*?)</script>', html, re.S).group(1)
         payload = json.loads(blob)
         check("payload carries both runs", len(payload["runs"]) == 2)
@@ -2354,6 +2825,102 @@ def cmd_selftest(args) -> int:
         check("purge left no dangling references",
               not con.execute("PRAGMA foreign_key_check").fetchall())
 
+        # a window over the days actually practised, for "how did this week go"
+        span = create_group(con, assignment="SPAN", label="SPAN")
+        for i, day in enumerate(("2026-03-01", "2026-03-02", "2026-03-05")):
+            sp = start_session(con, get_group(con, span), mode="letters",
+                               started_at=f"{day}T09:00:00+00:00")
+            add_run(con, sp["id"], ["EH", "SM" if i == 0 else "S."], "raw",
+                    is_final=True, recorded_at=f"{day}T09:0{i}:00+00:00")
+            finish_session(con, sp["id"], ["EH", "SM"])
+        sv = [load_group(con, span)]
+        check("practice days are the days with graded runs",
+              practice_days(sv) == ["2026-03-01", "2026-03-02", "2026-03-05"])
+        recent = practice_days(sv)[-2:]
+        check("a window skips over days off", recent == ["2026-03-02", "2026-03-05"])
+        miss_all, sent_all = char_counts(sv)
+        miss_win, sent_win = char_counts(sv, recent)
+        check("the window drops the oldest day's characters",
+              sent_win == Counter({"E": 2, "H": 2, "S": 2, "M": 2})
+              and sent_all["E"] == 3)
+        check("the window keeps only its own misses",
+              miss_win["M"] == 2 and miss_all["M"] == 2)
+        check("an oversized window is just everything",
+              char_counts(sv, practice_days(sv)[-99:]) == (miss_all, sent_all))
+        check("a window thresholds the combined total, not each day",
+              trouble_from(char_counts(sv, recent)[0]) == [("M", 2)]
+              and not trouble_from(char_counts(sv, recent[:1])[0]))
+
+        # operators: every group belongs to one, and listings follow
+        me = create_operator(con, "Test Op", " w0test ")
+        check("call sign normalised", get_operator(con, me)["callsign"] == "W0TEST")
+        check("found by call sign", find_operator(con, "w0test")["id"] == me)
+        check("found by id", find_operator(con, str(me))["id"] == me)
+        check("found by name", find_operator(con, "test op")["id"] == me)
+        check("adopting claims the older groups", adopt_unassigned(con, me) > 0
+              and all(g["operator_id"] == me for g in all_groups(con)))
+        check("the only operator becomes current", current_operator(con)["id"] == me)
+        them = create_operator(con, "Other Op", "K0OTH")
+        check("current stays put when a second appears",
+              current_operator(con)["id"] == me)
+        theirs = create_group(con, assignment="THEIRS", label="THEIRS",
+                              operator_id=them)
+        check("listings are scoped to one operator",
+              [g["id"] for g in all_groups(con, them)] == [theirs])
+        check("the other operator cannot see it",
+              theirs not in [g["id"] for g in all_groups(con, me)])
+        check("unscoped listings still see everyone",
+              len(all_groups(con)) == len(all_groups(con, me)) + 1)
+        check("last_group is per operator", last_group(con, them)["id"] == theirs)
+        check("payload carries the operator", report_payload(
+            load_all(con, them), list_operators(con))["groups"][0]["op"] == them)
+        set_current_operator(con, them)
+        check("switching operator sticks", current_operator(con)["id"] == them)
+        set_current_operator(con, me)
+        check("merging stays inside one operator", all(
+            len({_col(g, "operator_id") for g in [e["target"]] + e["absorb"]}) == 1
+            for e in merge_plan(con)))
+
+        # a database written before operators existed must migrate intact
+        old = Path(td) / "old.db"
+        oc = sqlite3.connect(old)
+        oc.executescript("""
+            CREATE TABLE groups (id INTEGER PRIMARY KEY, label TEXT, mode TEXT,
+              assignment TEXT NOT NULL, char_wpm REAL NOT NULL, eff_wpm REAL NOT NULL,
+              created_at TEXT NOT NULL, closed_at TEXT);
+            CREATE TABLE sessions (id INTEGER PRIMARY KEY, group_id INTEGER NOT NULL
+              REFERENCES groups(id) ON DELETE CASCADE, seq INTEGER NOT NULL,
+              mode TEXT NOT NULL, assignment TEXT NOT NULL, char_wpm REAL NOT NULL,
+              eff_wpm REAL NOT NULL, started_at TEXT NOT NULL, ended_at TEXT,
+              key_json TEXT, UNIQUE (group_id, seq));
+            CREATE TABLE runs (id INTEGER PRIMARY KEY, session_id INTEGER NOT NULL
+              REFERENCES sessions(id) ON DELETE CASCADE, seq INTEGER NOT NULL,
+              is_final INTEGER NOT NULL DEFAULT 0, recorded_at TEXT NOT NULL,
+              attempt_json TEXT NOT NULL, reported_json TEXT, raw_paste TEXT NOT NULL,
+              UNIQUE (session_id, seq));
+            INSERT INTO groups VALUES
+              (1,'OLD','letters','OLD',25,6,'2026-01-01T00:00:00+00:00',NULL);
+            INSERT INTO sessions VALUES
+              (1,1,1,'letters','OLD',25,6,'2026-01-01T00:00:00+00:00',NULL,'["EH"]');
+            INSERT INTO runs VALUES
+              (1,1,1,1,'2026-01-01T00:00:00+00:00','["EH"]',NULL,'raw');
+        """)
+        oc.commit()
+        oc.close()
+        mc = connect(old)
+        check("migration keeps every row",
+              mc.execute("SELECT COUNT(*) FROM runs").fetchone()[0] == 1
+              and len(all_groups(mc)) == 1)
+        check("migration adds operator_id", "operator_id" in
+              {r["name"] for r in mc.execute("PRAGMA table_info(groups)")})
+        legacy = create_operator(mc, "Legacy Op", "W0OLD")
+        check("pre-operator groups adopt the first operator",
+              adopt_unassigned(mc, legacy) == 1
+              and all_groups(mc, legacy)[0]["label"] == "OLD")
+        check("migration left no dangling references",
+              not mc.execute("PRAGMA foreign_key_check").fetchall())
+        mc.close()
+
         # a hostile label must not be able to close the data script tag
         nasty = create_group(con, "letters", "x", 20, 10,
                              label='</script><img src=x onerror=alert(1)>')
@@ -2390,8 +2957,18 @@ def main(argv=None) -> int:
     )
     sub = ap.add_subparsers(dest="cmd")
 
-    sub.add_parser("record", help="record sessions (default)").set_defaults(fn=cmd_record)
-    sub.add_parser("groups", help="list groups").set_defaults(fn=cmd_groups)
+    rec = sub.add_parser("record", help="record sessions (default)")
+    rec.set_defaults(fn=cmd_record)
+    grp = sub.add_parser("groups", help="list groups")
+    grp.set_defaults(fn=cmd_groups)
+
+    u = sub.add_parser("user", help="show operators, add one, or switch")
+    u.add_argument("--add", action="store_true", help="add an operator")
+    u.add_argument("--use", metavar="WHO", help="record for this operator from now on")
+    u.add_argument("--remove", metavar="WHO", help="remove an operator who owns no groups")
+    u.add_argument("--name", help="with --add, or on its own to rename the current one")
+    u.add_argument("--call", help="call sign, same rules as --name")
+    u.set_defaults(fn=cmd_user)
 
     r = sub.add_parser("report", help="build the HTML report")
     r.add_argument("-g", "--group", type=int, help="limit to one group id")
@@ -2402,6 +2979,8 @@ def main(argv=None) -> int:
     t = sub.add_parser("trouble", help="show trouble letters")
     t.add_argument("-g", "--group", type=int)
     t.add_argument("-n", "--threshold", type=int, default=TROUBLE_THRESHOLD)
+    t.add_argument("-d", "--days", type=int, metavar="N",
+                   help="only the last N days you practised")
     t.set_defaults(fn=cmd_trouble)
 
     k = sub.add_parser("key", help="attach a results table to an ungraded session")
@@ -2433,6 +3012,14 @@ def main(argv=None) -> int:
     mg.set_defaults(fn=cmd_merge)
 
     sub.add_parser("selftest", help="run built-in checks").set_defaults(fn=cmd_selftest)
+
+    # every command that reads or writes practice data works on one operator
+    for pr in (rec, grp, r, t, k, sp):
+        pr.add_argument("-u", "--user", metavar="WHO",
+                        help="operator: call sign, name, or id")
+    for pr in (grp, r, t):
+        pr.add_argument("--everyone", action="store_true",
+                        help="every operator, not just the current one")
 
     args = ap.parse_args(argv)
     if not getattr(args, "fn", None):

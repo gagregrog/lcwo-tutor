@@ -14,10 +14,16 @@ make help       everything else
 ## How it works
 
 ```
-group  ──  one homework assignment (S2HW3)
- └ session  ──  one Copy exercise = one audio clip, with its own drill and speed
-    └ run   ──  one attempt at that clip
+operator  ──  you: a name and a call sign
+ └ group  ──  one homework assignment (S2HW3)
+    └ session  ──  one Copy exercise = one audio clip, with its own drill and speed
+       └ run   ──  one attempt at that clip
 ```
+
+The first time you record, it asks who is copying and files everything under
+that call sign. With one operator on file it never asks again; add a second
+(`make user ADD=1`) and recording starts by asking which of you it is. Every
+group, and so every number in every report, belongs to exactly one operator.
 
 CW Academy homework alternates **Send 1 → Copy 1, Send 2 → Copy 2, …**. Only the
 copies are gradeable, so a send block is simply a gap: come back to copying and
@@ -49,17 +55,40 @@ HR           SR               HR       1
 
 ## What you get
 
-A self-contained HTML report with a scope filter at the top — **all time, a day,
-an assignment, a drill type, or a single session** — that recomputes every panel
-for what you picked:
+A self-contained HTML report with a filter bar at the top. The dimensions are
+independent and combine — **a date range, an operator, an assignment, a session,
+a drill type** — so "the last two days, letters only" is one filter rather than
+a view somebody had to think of in advance. Every panel recomputes for whatever
+is set:
 
-- **Practice these** — characters missed twice or more, broken down across the
-  level below whatever you are looking at
+- **Practice these** — characters missed twice or more **across everything the
+  filter covers**, not per day. Miss `W` once on Tuesday and once on Wednesday
+  and a two-day range lists it at ×2; the columns beside it decompose that
+  total by day (or session, or assignment) rather than each applying the
+  threshold again
 - **Confusions** — `Y → L ×5`, `K → R ×4`. Usually the most useful panel: a
   consistent substitution means two rhythms you are conflating, which needs a
   different fix from a character you simply do not know
 - **Accuracy per run** — hover any point for its run and score
 - **Runs in scope** — click a row to see exactly what went wrong, group by group
+
+Presets across the top (*All time*, the latest day, *Last 2 days*, latest
+assignment, latest session) set the whole filter in one click, **Clear** resets
+it, and each dropdown shows how many runs a choice would leave you with, so an
+empty combination is visible before you pick it. The filter lives in the URL
+(`#from=2026-09-09&drill=letters`), so a particular view is linkable and
+survives a reload.
+
+The same question from the terminal:
+
+```
+make trouble D=2        letters missed 2+ times over your last 2 practice days
+make trouble D=7 N=3    missed 3+ times over the last 7
+```
+
+`D=` counts days you actually practised, not calendar days — skip a Tuesday and
+`D=2` still means your last two sessions' worth. Same threshold rule as the
+report: the count is the total over the whole window.
 
 ## Commands
 
@@ -67,8 +96,9 @@ for what you picked:
 |---|---|
 | `make` | record a session (resume the last group, or start a new one) |
 | `make report` | rebuild the HTML report and open it |
+| `make user` | who is on file, and who is being recorded for |
 | `make groups` | list groups with accuracy and trouble letters |
-| `make trouble` | trouble letters in the terminal — `N=3` to change the threshold |
+| `make trouble` | trouble letters — `D=2` for the last 2 practice days, `N=3` for the threshold |
 | `make merge` | fold groups that share an assignment into one (`APPLY=1` to write) |
 | `make delete G=11` | move a group (or `S=`/`R=`) to the bin — reversible |
 | `make restore G=11` | bring it back |
@@ -80,6 +110,29 @@ for what you picked:
 | `make test` | run the Python and browser test suites |
 
 All of it works without `make` too: `python3 lcwo.py <command>`.
+
+Anything that reads or writes practice data takes `U=<call sign>` to act as
+another operator for that one command (`make report U=KD7ABC`), and the
+listing commands take `EVERYONE=1` to drop the filter entirely.
+
+## More than one operator
+
+```
+make user                        who is on file, and who is current
+make user ADD=1                  add one (asks for name and call sign)
+make user USE=KD7ABC             record for them from now on
+make user NAME="Sam Example"     rename the current operator (or CALL=)
+make user REMOVE=KD7ABC          remove one, if they own no groups
+```
+
+Switching is sticky — it is remembered until you switch again — and `record`
+shows you who it is recording for before it asks anything else. Each operator
+gets their own report under `reports/<call sign>/` once there is more than one,
+so nobody overwrites anybody. `make report EVERYONE=1` builds a combined page
+with an extra **By operator** filter.
+
+A database recorded before operators existed still works: the first operator
+you add adopts every group already in it.
 
 ## Demoing, and undoing
 
@@ -97,16 +150,17 @@ bookkeeping exercise. You can also bin a single session or run (`S=`, `R=`).
 anything; it asks you to type `purge` to confirm.
 
 For anything the commands don't cover, `make db` opens a SQLite shell. The
-tables are `groups`, `sessions`, `runs`; the views `live_groups`,
-`live_sessions`, `live_runs` apply the bin rule for you, and are what the
-tool reads.
+tables are `operators`, `settings`, `groups`, `sessions`, `runs`; the views
+`live_groups`, `live_sessions`, `live_runs` apply the bin rule for you, and are
+what the tool reads.
 
 ## Your data stays local
 
-Everything lives in `lcwo.db` next to the script, and nothing is ever sent
-anywhere. `.gitignore` keeps both the database and `reports/` out of version
-control — **a generated report embeds the whole graded dataset as JSON**, so
-publishing one publishes every session it covers.
+Everything lives in `lcwo.db` next to the script — including your name and
+call sign — and nothing is ever sent anywhere. `.gitignore` keeps both the
+database and `reports/` out of version control — **a generated report embeds
+the whole graded dataset as JSON**, so publishing one publishes every session
+it covers, and the call sign it belongs to.
 
 ## More
 

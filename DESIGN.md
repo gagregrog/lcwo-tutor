@@ -25,7 +25,8 @@ a column.
 
 ## Trouble letters
 
-A **trouble letter** is any character missed 2 or more times within a scope.
+A **trouble letter** is any character missed 2 or more times within the
+current filter.
 The report shows the tally at every level:
 
 - **per run** — the `Chars missed` column in the session table
@@ -41,26 +42,59 @@ There's also a **confusion table** (`H → S ×2`) which is usually the most
 actionable thing in the report — consistent substitutions point at two characters
 whose rhythms you're conflating, which is a different fix from just not knowing one.
 
+A note on what the threshold applies to: `trouble()` runs over the totals for
+*everything the filter covers*, so two misses spread across two days count the
+same as two in one sitting. The breakdown columns then split that total by the
+child level — they are a decomposition of the listed number, never a second
+threshold. Thresholding per day and unioning would answer a different and much
+less useful question ("did I have a bad day with this letter"), and would drop
+exactly the characters that are quietly wrong all week.
 
 ## The report
 
-`reports/index.html` covers everything; `reports/group-N.html` is one group.
+`reports/index.html` covers one operator's practice; `reports/group-N.html` is
+one group. Once a second operator exists each gets their own tree
+(`reports/<call sign>/`) so a rebuild cannot overwrite somebody else's page.
 Self-contained (no network, no CDN), light/dark aware, rebuilt at the end of a
 recording run or on demand with `make report`.
 
-### The scope filter
+### The filter
 
-Everything on the page is driven by one **scope** control at the top:
+Everything on the page is driven by one filter object with six independent
+dimensions, AND-ed together:
 
+```js
+{from, to, op, gid, sid, drill}   // null means "don't care"
 ```
-All time  ·  a day  ·  a group  ·  a session
-```
 
-Pick a scope and every panel recomputes for it — the tiles, the practice list,
-the confusions, the chart, the runs. There are also one-click shortcuts for
-*All time*, *today*, *latest group*, and *latest session*, and the scope is
-written to the URL fragment, so a particular view is linkable and survives a
-reload.
+The first version had a single `scope` select — all time, *or* a day, *or* a
+group. That only answers questions somebody predicted. "Which letters did I
+miss twice over the last two days" is a date range crossed with nothing else,
+and no single-select could express it: the two days spanned two assignments,
+and the assignment that covered them also covered a third day.
+
+So the control is a bar of small selects, one per dimension, rather than a list
+of named views. Consequences worth knowing:
+
+- **Counts are contextual.** Each option shows the runs you would be left with
+  *given the other filters*, computed by re-running the filter with that one
+  dimension swapped. An empty combination is visible before you click it.
+- **The controls keep themselves coherent.** Sessions cascade off the chosen
+  assignment; picking a session pins its assignment; an inverted date range
+  clears the other end instead of silently showing nothing.
+- **The breakdown columns follow what is pinned** rather than a scope type:
+  runs inside a session, sessions inside an assignment, days when the range
+  spans several, assignments otherwise.
+- **The whole filter is the URL** — `#from=2026-09-09&drill=letters`. Links
+  written by the old scheme (`#group:8`, `#day:…`, `#drill:…`) still resolve,
+  translated on the way in.
+- Operator and drill controls hide themselves when there is only one of them,
+  so the bar stays short for the common case.
+
+Presets are just filters: *All time*, the latest day, *Last 2 days*, latest
+assignment, latest session. "Last N days" counts days with practice rather than
+calendar days, so a day off does not empty the window — the same rule the CLI's
+`lcwo trouble --days N` uses.
 
 The page carries the graded data as JSON and totals it in the browser. Grading
 still happens in Python — the page only ever sums per-character verdicts it is
@@ -123,6 +157,30 @@ question only, and permanently.
 their sessions chronologically. It is a dry run unless given `--apply`, and it
 refuses to finish if the run count changes or a foreign key is left dangling.
 
+## Operators
+
+Every group carries an `operator_id`; sessions and runs inherit one through
+their group. Nothing else needed a column: a group is one homework assignment
+and homework belongs to one person, so putting the owner any deeper would only
+create the possibility of a group split between two operators — a state with no
+real-world meaning that every rollup would then have to handle.
+
+Which operator is current lives in `settings`, not in a column on `operators`,
+so "who am I recording for" is one row to write and cannot end up true of two
+rows at once. It is sticky across invocations, which is what makes the common
+single-operator case silent: `record` prints who it is recording for and asks
+nothing. The prompt only appears when the answer is genuinely ambiguous — no
+operators on file, or more than one.
+
+Scoping is a query filter (`_owned`), not another view. The soft-delete views
+answer "does this row exist"; an operator filter answers "whose is it", and
+folding the second into the first would make one person's data look deleted to
+another and quietly change what `trash` and `purge` see.
+
+A database from before this existed has `operator_id IS NULL` everywhere. The
+first operator added adopts those rows (`adopt_unassigned`), which is the only
+backfill that needs no guesswork — there was exactly one person using it.
+
 ## Soft delete
 
 `groups`, `sessions` and `runs` each carry a nullable `deleted_at`. Rather than
@@ -159,8 +217,8 @@ verifies `PRAGMA foreign_key_check` afterwards.
 
 ## Storage
 
-SQLite at `lcwo.db` next to the script — four tables (`groups`, `sessions`,
-`runs`, and the derived grading is computed at read time, never stored). Every
+SQLite at `lcwo.db` next to the script — `operators`, `settings`, `groups`,
+`sessions`, `runs`. Grading is derived at read time, never stored. Every
 session and run is timestamped, so date-based analysis later is just SQL. The
 raw text of every paste is kept verbatim in `runs.raw_paste`, so if the grading
 logic ever changes, everything re-grades from source with no data loss.
@@ -177,11 +235,16 @@ Override paths with `LCWO_HOME`, `LCWO_DB`, or `LCWO_REPORTS`.
 
 ## Extending
 
+- **New per-operator data** (goals, target speeds, exam dates) — hangs off
+  `operators`; nothing below the group level needs to know about it.
 - **New drill types** — add to `MODES` at the top; it's stored as a plain string,
   so old rows keep working.
 - **Longer groups** — nothing assumes 2 characters. Five-char code groups grade
   correctly as-is; the parser just warns when group widths are inconsistent,
   which is how a mangled paste announces itself.
+- **New filter dimensions** — add the key to `EMPTY`, one clause to
+  `filterRuns`, and one select to the bar; everything else (URL, counts,
+  presets, validation) iterates over `DIMS`.
 - **New metrics** — grading is pure functions over `(key, attempt)` in the
   grading-engine section, with no I/O. Add a property to `RunGrade` and it
   rolls up through `SessionView` → `GroupView` automatically.

@@ -57,16 +57,24 @@ function parseTags(html, sel){
 const els = {};
 function mk(id){
   if (!els[id]) els[id] = {id, _html:'', textContent:'', value:'', hidden:false,
-    dataset:{}, _attrs:{},
+    dataset:{}, _attrs:{}, _cache:{}, _cacheHtml:null,
     get innerHTML(){ return this._html; }, set innerHTML(v){ this._html = v; },
     getAttribute(k){ return this._attrs[k] ?? null; },
     setAttribute(k, v){ this._attrs[k] = v; },
-    querySelectorAll(sel){ return parseTags(this._html, sel); },
-    querySelector(sel){ return parseTags(this._html, sel)[0] || null; }};
+    // Same html, same element objects: a handler bound through one query has
+    // to still be there for the next one, or a dead handler looks alive.
+    querySelectorAll(sel){
+      if (this._cacheHtml !== this._html){ this._cacheHtml = this._html; this._cache = {}; }
+      return this._cache[sel] || (this._cache[sel] = parseTags(this._html, sel));
+    },
+    querySelector(sel){ return this.querySelectorAll(sel)[0] || null; }};
   return els[id];
 }
 global.document = {getElementById: mk,
-  querySelectorAll: sel => mk('quick').querySelectorAll(sel)};
+  querySelectorAll(sel){
+    const m = sel.match(/^#([\w-]+)\s+(.*)$/);
+    return m ? mk(m[1]).querySelectorAll(m[2]) : mk('quick').querySelectorAll(sel);
+  }};
 global.location = {hash: ''};
 global.history = {replaceState(a, b, h){ global.location.hash = h; }};
 const _listeners = {};
@@ -88,87 +96,193 @@ global.done = () => { console.log(FAIL ? `\n${FAIL} failure(s)` : '\n  all brows
 FIXTURE_TESTS = r"""
 // ---- the click path, which is what actually broke in the wild ----
 const btns = document.getElementById('quick').querySelectorAll('button');
-check('quick buttons rendered', btns.length >= 1, 'got ' + btns.length);
+check('quick presets rendered', btns.length >= 3, 'got ' + btns.length);
 for (const b of btns){
   const entry = QUICK[+b.dataset.i];
-  check('button "' + entry[0] + '" carries a scope object',
-        entry && entry[1] && typeof entry[1].t === 'string');
-  setScope(entry[1]);
-  check('button "' + entry[0] + '" sets a real scope',
-        sc.t && location.hash !== '#undefined:undefined',
-        'hash=' + location.hash);
+  check('preset "' + entry[0] + '" carries a filter object',
+        !!entry && !!entry[1] && DIMS.every(k => k in entry[1]));
+  b.onclick();
+  check('preset "' + entry[0] + '" sets a real filter',
+        !/undefined|NaN/.test(location.hash), 'hash=' + location.hash);
+  check('preset "' + entry[0] + '" marks itself pressed',
+        b.getAttribute('aria-pressed') === 'true');
   const h = document.getElementById('app').innerHTML;
-  check('button "' + entry[0] + '" renders', h.length > 200 && !/undefined|NaN/.test(h));
+  check('preset "' + entry[0] + '" renders', h.length > 200 && !/undefined|NaN/.test(h));
 }
 
-// ---- deep links: `record` opens the report at #group:<id> ----
-const gid = String(DATA.groups[0].id);
-location.hash = '#group:' + gid;
-check('#group:<id> parses to that group',
-      JSON.stringify(scopeFromHash()) === JSON.stringify({t:'group', k:gid}));
+// ---- filters combine, which is the whole point ----
+setFilter({...EMPTY});
+const total = filterRuns(F).length;
+check('three practice days in the fixture', days.length === 3, days.join(','));
+
+setFilter({from: days[1]});
+const dated = filterRuns(F);
+check('a date floor narrows', dated.length < total && dated.length > 0,
+      dated.length + '/' + total);
+check('nothing before the floor survives', dated.every(r => r.day >= days[1]));
+
+setFilter({from: days[1], to: days[1]});
+check('a single-day range is that day alone',
+      filterRuns(F).length > 0 && filterRuns(F).every(r => r.day === days[1]));
+
+setFilter({from: days[1], drill: 'letters'});
+const both = filterRuns(F);
+check('date and drill apply together',
+      both.every(r => r.day >= days[1] && drillOf(r) === 'letters'));
+check('two conditions are at least as narrow as one', both.length <= dated.length);
+check('the label names both dimensions',
+      filterLabel(F).includes('Letters') && filterLabel(F).includes(fmtDay(days[1])),
+      filterLabel(F));
+
+setFilter({from: days[1], drill: 'letters', op: ops[0]});
+check('three conditions apply together', filterRuns(F).every(r =>
+  r.day >= days[1] && drillOf(r) === 'letters' && String(opOf(r)) === ops[0]));
+
+setFilter({from: days[days.length - 1], to: days[0]});
+check('an impossible range yields nothing', filterRuns(F).length === 0);
+check('an empty result is reported, not crashed',
+      document.getElementById('app').innerHTML.includes('No graded runs'));
+
+// ---- the controls drive it, and stay coherent ----
+setFilter({...EMPTY});
+const gsel = document.getElementById('f-gid');
+gsel.value = String(DATA.groups[0].id);
+gsel.onchange();
+check('the assignment control filters', String(F.gid) === String(DATA.groups[0].id));
+check('only that assignment is left',
+      filterRuns(F).every(r => r.gid === DATA.groups[0].id));
+const inGroup = DATA.sessions.filter(s => s.gid === DATA.groups[0].id)[0];
+const ssel = document.getElementById('f-sid');
+ssel.value = String(inGroup.id);
+ssel.onchange();
+check('picking a session pins its assignment too',
+      String(F.sid) === String(inGroup.id) && String(F.gid) === String(inGroup.gid));
+const other = DATA.groups.find(g => g.id !== DATA.groups[0].id);
+gsel.value = String(other.id);
+gsel.onchange();
+check('changing assignment drops a session that cannot belong to it',
+      F.sid === null && String(F.gid) === String(other.id));
+document.getElementById('f-from').value = days[2];
+document.getElementById('f-from').onchange();
+document.getElementById('f-to').value = days[0];
+document.getElementById('f-to').onchange();
+check('an inverted range is corrected instead of emptied',
+      !(F.from && F.to && F.from > F.to), JSON.stringify(F));
+document.getElementById('clear').onclick();
+check('clear resets every dimension',
+      isEmpty(F) && filterRuns(F).length === total);
+check('option counts warn before you empty the page',
+      document.getElementById('f-drill').innerHTML.includes('('));
+
+// ---- the URL carries the whole combination ----
+setFilter({from: days[1], drill: 'letters'});
+check('the hash carries every active dimension',
+      location.hash.includes('from=') && location.hash.includes('drill=letters'),
+      location.hash);
+check('the hash round-trips',
+      JSON.stringify(filterFromHash()) === JSON.stringify(F));
+location.hash = '#group:' + DATA.groups[0].id;
+check('a legacy #group link still opens',
+      String((filterFromHash() || {}).gid) === String(DATA.groups[0].id));
+location.hash = '#day:' + days[0];
+const leg = filterFromHash() || {};
+check('a legacy #day link becomes a one-day range',
+      leg.from === days[0] && leg.to === days[0]);
 location.hash = '#all';
-check('#all parses', (scopeFromHash() || {}).t === 'all');
-location.hash = '#group:99999';
-check('unknown id falls back to all time', scopeFromHash() === null);
+check('#all clears everything', isEmpty(filterFromHash() || {from:'x'}));
+location.hash = '#gid=99999';
+check('an unknown id falls back', filterFromHash() === null);
 location.hash = '#nonsense';
-check('malformed fragment falls back to all time', scopeFromHash() === null);
+check('a malformed fragment falls back', filterFromHash() === null);
 location.hash = '';
-check('no fragment falls back to all time', scopeFromHash() === null);
+check('no fragment falls back', filterFromHash() === null);
+setFilter({...EMPTY});
+dispatchHash('#gid=' + DATA.groups[0].id);
+check('hashchange re-filters an open page',
+      String(F.gid) === String(DATA.groups[0].id), JSON.stringify(F));
 
-setScope({t:'all', k:null});
-dispatchHash('#group:' + gid);
-check('hashchange re-scopes an open page',
-      sc.t === 'group' && String(sc.k) === gid, 'sc=' + JSON.stringify(sc));
-const deepHtml = document.getElementById('app').innerHTML;
-check('deep-linked view renders', deepHtml.length > 200 && !/undefined|NaN/.test(deepHtml));
-check('deep-linked view is scoped to one group',
-      new Set(scopeRuns(sc).map(r => r.gid)).size === 1);
-
-// ---- drill is its own filter dimension ----
+// ---- each dimension on its own still partitions the data ----
 check('two drills detected', drills.length === 2, drills.join(','));
-for (const d of drills){
-  setScope({t:'drill', k:d});
-  const rs = scopeRuns(sc);
-  check('drill "' + d + '" selects only its sessions',
-        rs.length > 0 && rs.every(r => drillOf(r) === d));
-  const h = document.getElementById('app').innerHTML;
-  check('drill "' + d + '" renders', h.length > 200 && !/undefined|NaN/.test(h));
-}
-const sum = drills.reduce((n, d) => n + scopeRuns({t:'drill', k:d}).length, 0);
-check('drill scopes partition every run', sum === graded.length, sum + ' vs ' + graded.length);
-location.hash = '#drill:' + drills[0];
-check('#drill:<mode> deep links', (scopeFromHash() || {}).t === 'drill');
-location.hash = '#drill:nosuchdrill';
-check('unknown drill falls back', scopeFromHash() === null);
-setScope({t:'group', k:String(DATA.groups[0].id)});
-check('mixed group shows a drill badge',
-      document.getElementById('app').innerHTML.includes('pill drill'));
+const dsum = drills.reduce((n, d) => n + filterRuns({...EMPTY, drill:d}).length, 0);
+check('drill filters partition every run', dsum === graded.length);
+check('two operators detected', ops.length === 2, ops.join(','));
+const osum = ops.reduce((n, o) => n + filterRuns({...EMPTY, op:o}).length, 0);
+check('operator filters partition every run', osum === graded.length);
+const daysum = days.reduce((n, d) => n + filterRuns({...EMPTY, from:d, to:d}).length, 0);
+check('day filters partition every run', daysum === graded.length);
 
-// ---- every scope renders ----
-const scopes = [{t:'all', k:null}, ...days.map(d => ({t:'day', k:d})),
-  ...DATA.groups.map(g => ({t:'group', k:String(g.id)})),
-  ...DATA.sessions.map(s => ({t:'session', k:String(s.id)}))];
+// ---- the threshold applies to the whole filter, not to each day ----
+setFilter({...EMPTY});
+const combined = trouble(stats(filterRuns(F)));
+const perDay = d => stats(filterRuns({...EMPTY, from:d, to:d}));
+check('every listed count is the sum over the days in range',
+      combined.every(([c, m]) =>
+        m.total === days.reduce((n, d) => n + (perDay(d).miss.get(c)?.total || 0), 0)),
+      combined.map(([c, m]) => c + ':' + m.total).join(' '));
+const union = new Set(days.flatMap(d =>
+  [...perDay(d).miss.entries()].filter(([, m]) => m.total >= TH).map(([c]) => c)));
+check('a character missed once on each of two days still qualifies',
+      combined.some(([c]) => !union.has(c)),
+      'combined=' + combined.length + ' union-of-days=' + union.size);
+const kids = children(F, filterRuns(F));
+check('the day columns sum back to the listed total',
+      kids.length === days.length && combined.every(([c, m]) =>
+        kids.reduce((n, k) => n + (stats(k.runs).miss.get(c)?.total || 0), 0) === m.total));
+
+// ---- the breakdown follows whatever is pinned ----
+setFilter({...EMPTY});
+check('a multi-day view breaks down by day',
+      children(F, filterRuns(F)).length === days.length);
+setFilter({gid: String(DATA.groups[0].id)});
+check('an assignment breaks down by session',
+      children(F, filterRuns(F)).every(k => String(k.short).startsWith('S')));
+setFilter({sid: String(DATA.sessions[0].id)});
+check('a session breaks down by run',
+      children(F, filterRuns(F)).every(k => String(k.short).startsWith('R')));
+
+// ---- badges appear only where they add something ----
+setFilter({...EMPTY});
+const wide = document.getElementById('app').innerHTML;
+check('run rows carry an operator badge', wide.includes('pill op'));
+check('run rows carry a drill badge', wide.includes('pill drill'));
+setFilter({drill: drills[0]});
+check('the drill badge goes away once pinned',
+      !document.getElementById('app').innerHTML.includes('pill drill'));
+setFilter({gid: String(DATA.groups[0].id)});
+check('assignment context names its operator',
+      document.getElementById('app').innerHTML.includes('Operator'));
+
+// ---- every combination renders ----
+const combos = [{...EMPTY},
+  ...days.map(d => ({...EMPTY, from:d, to:d})),
+  ...days.map(d => ({...EMPTY, from:d})),
+  ...ops.map(o => ({...EMPTY, op:o})),
+  ...drills.map(d => ({...EMPTY, drill:d})),
+  ...DATA.groups.map(g => ({...EMPTY, gid:String(g.id)})),
+  ...DATA.sessions.map(s => ({...EMPTY, gid:String(s.gid), sid:String(s.id)})),
+  {...EMPTY, from:days[1], drill:drills[0]},
+  {...EMPTY, from:days[0], to:days[1], op:ops[0]}];
 let bad = [];
-for (const s of scopes){
+for (const f of combos){
   try {
-    setScope(s);
+    setFilter(f);
     const h = document.getElementById('app').innerHTML;
     if (!h || /undefined|NaN|\[object/.test(h)) throw new Error('placeholder leaked');
-  } catch (e){ bad.push(JSON.stringify(s) + ': ' + e.message); }
+  } catch (e){ bad.push(JSON.stringify(f) + ': ' + e.message); }
 }
-check(scopes.length + ' scopes render', !bad.length, bad[0]);
+check(combos.length + ' filter combinations render', !bad.length, bad[0]);
 
 // ---- totals must agree with the Python figures handed in ----
-setScope({t:'all', k:null});
+setFilter({...EMPTY});
 const all = stats(graded);
 check('char total matches Python', all.chars === EXPECT.chars, `${all.chars} vs ${EXPECT.chars}`);
 check('wrong total matches Python', all.wrong === EXPECT.wrong, `${all.wrong} vs ${EXPECT.wrong}`);
 let sc2 = 0, sw = 0;
 for (const g of DATA.groups){
-  const st = stats(scopeRuns({t:'group', k:String(g.id)}));
+  const st = stats(filterRuns({...EMPTY, gid:String(g.id)}));
   sc2 += st.chars; sw += st.wrong;
 }
-check('per-group scopes sum to all-time', sc2 === all.chars && sw === all.wrong);
+check('per-assignment filters sum to all time', sc2 === all.chars && sw === all.wrong);
 
 // ---- transposed column appears only when there are transpositions ----
 const withT = DATA.runs.some(r => r.cells.some(c => c[2].includes('t')));
@@ -193,22 +307,29 @@ done();
 """
 
 SMOKE_TESTS = r"""
-const scopes = [{t:'all', k:null}, ...days.map(d => ({t:'day', k:d})),
-  ...DATA.groups.map(g => ({t:'group', k:String(g.id)})),
-  ...DATA.sessions.map(s => ({t:'session', k:String(s.id)}))];
+const combos = [{...EMPTY},
+  ...days.map(d => ({...EMPTY, from:d, to:d})),
+  ...WINDOWS.map(w => ({...EMPTY, from: days[days.length - w]})),
+  ...ops.map(o => ({...EMPTY, op:o})),
+  ...drills.map(d => ({...EMPTY, drill:d})),
+  ...DATA.groups.map(g => ({...EMPTY, gid:String(g.id)})),
+  ...DATA.sessions.map(s => ({...EMPTY, gid:String(s.gid), sid:String(s.id)}))];
+if (days.length > 1 && drills.length > 1)
+  combos.push({...EMPTY, from: days[days.length - 2], drill: drills[0]});
 let bad = [];
-for (const s of scopes){
+for (const f of combos){
   try {
-    setScope(s);
+    setFilter(f);
     const h = document.getElementById('app').innerHTML;
     if (!h || /undefined|NaN|\[object/.test(h)) throw new Error('placeholder leaked');
-  } catch (e){ bad.push(JSON.stringify(s) + ': ' + e.message); }
+  } catch (e){ bad.push(JSON.stringify(f) + ': ' + e.message); }
 }
-check('live data: ' + scopes.length + ' scopes render', !bad.length, bad[0]);
+check('live data: ' + combos.length + ' combinations render', !bad.length, bad[0]);
 for (const b of document.getElementById('quick').querySelectorAll('button')){
   const e = QUICK[+b.dataset.i];
-  setScope(e[1]);
-  check('live data: "' + e[0] + '" works', sc.t && location.hash !== '#undefined:undefined');
+  b.onclick();
+  check('live data: preset "' + e[0] + '" works',
+        !/undefined|NaN/.test(location.hash) && b.getAttribute('aria-pressed') === 'true');
 }
 done();
 """
@@ -228,23 +349,41 @@ def harness(html: str, tests: str, expect: dict | None = None) -> str:
 
 def build_fixture(con) -> list:
     """A small group with known properties, including a transposition."""
-    gid = lcwo.create_group(con, assignment="FIXTURE", label="FIXTURE")
+    me = lcwo.create_operator(con, "Fixture Op", "W0FIX")
+    gid = lcwo.create_group(con, assignment="FIXTURE", label="FIXTURE",
+                            operator_id=me)
     grp = lcwo.get_group(con, gid)
     key = ["EH", "SM", "TR", "BU", "WM", "QX"]
-    sess = lcwo.start_session(con, grp, mode="letters", char_wpm=25, eff_wpm=6)
+    # three separate days, so date ranges have something to slice
+    day1, day2, day3 = (f"2026-04-0{n}T09:00:00+00:00" for n in (1, 2, 3))
+    sess = lcwo.start_session(con, grp, mode="letters", char_wpm=25, eff_wpm=6,
+                              started_at=day1)
     for i, attempt in enumerate([["EH", "S.", "T.", ".U", "MW", "QX"],
                                  ["EH", "SM", "TR", "BU", "WM", "QX"]]):
-        lcwo.add_run(con, sess["id"], attempt, "fixture", is_final=(i == 1))
+        lcwo.add_run(con, sess["id"], attempt, "fixture", is_final=(i == 1),
+                     recorded_at=day1)
     lcwo.finish_session(con, sess["id"], key)
-    sess2 = lcwo.start_session(con, grp, mode="letters", char_wpm=25, eff_wpm=6)
+    sess2 = lcwo.start_session(con, grp, mode="letters", char_wpm=25, eff_wpm=6,
+                               started_at=day2)
     lcwo.add_run(con, sess2["id"], ["EH", "SM", "TR", "BU", "MW", "QX"], "fixture",
-                 is_final=True)
+                 is_final=True, recorded_at=day2)
     lcwo.finish_session(con, sess2["id"], key)
     # a second drill in the same assignment, so the drill filter has something
     # to separate
-    sess3 = lcwo.start_session(con, grp, mode="custom", char_wpm=28, eff_wpm=8)
-    lcwo.add_run(con, sess3["id"], ["KY", "V.", "JZ"], "fixture", is_final=True)
+    sess3 = lcwo.start_session(con, grp, mode="custom", char_wpm=28, eff_wpm=8,
+                               started_at=day3)
+    lcwo.add_run(con, sess3["id"], ["KY", "V.", "JZ"], "fixture", is_final=True,
+                 recorded_at=day3)
     lcwo.finish_session(con, sess3["id"], ["KY", "VG", "JZ"])
+    # a second operator, so the operator filter has two sides to separate
+    them = lcwo.create_operator(con, "Other Op", "K0OTH")
+    ogid = lcwo.create_group(con, assignment="OTHER", label="OTHER",
+                             operator_id=them)
+    osess = lcwo.start_session(con, lcwo.get_group(con, ogid), mode="letters",
+                               char_wpm=20, eff_wpm=5, started_at=day3)
+    lcwo.add_run(con, osess["id"], ["EH", "S.", "TR"], "fixture", is_final=True,
+                 recorded_at=day3)
+    lcwo.finish_session(con, osess["id"], ["EH", "SM", "TR"])
     return lcwo.load_all(con)
 
 
@@ -271,16 +410,18 @@ def main() -> int:
         runs = [r for v in views for r in v.graded_runs]
         expect = {"chars": sum(r.grade.total_chars for r in runs),
                   "wrong": sum(r.grade.wrong_chars for r in runs)}
-        html = lcwo.build_report(views, "Fixture")
+        html = lcwo.build_report(views, "Fixture", lcwo.list_operators(con))
         con.close()
         ok &= run("fixture", harness(html, FIXTURE_TESTS, expect), node)
 
     if lcwo.DB_PATH.exists():
         con = lcwo.connect()
         views = lcwo.load_all(con)
+        operators = lcwo.list_operators(con)
         con.close()
         if any(v.graded_runs for v in views):
-            ok &= run("live database", harness(lcwo.build_report(views), SMOKE_TESTS), node)
+            html = lcwo.build_report(views, "LCWO progress", operators)
+            ok &= run("live database", harness(html, SMOKE_TESTS), node)
     return 0 if ok else 1
 
 
