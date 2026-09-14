@@ -50,6 +50,11 @@ MODES = [
     ("custom", "Error practice"),
 ]
 
+# CW Academy numbers homework S<session>HW<1-3>: three assignments per session,
+# then the session rolls over. Anything not in that shape is left alone.
+ASSIGNMENT_RE = re.compile(r"\s*S(\d+)HW([1-3])\s*$", re.I)
+HW_PER_SESSION = 3
+
 MISS_KINDS = ("missed", "wrong", "transposed")
 SOFT_RUN_LIMIT = 3  # you said 1-3; past this we just nudge
 SOFT_SESSION_LIMIT = 3
@@ -512,6 +517,20 @@ def create_group(con, mode=None, assignment="", char_wpm=None, eff_wpm=None,
     )
     con.commit()
     return cur.lastrowid
+
+
+def next_assignment(labels) -> str | None:
+    """The assignment after the highest-numbered one on file.
+
+    Highest rather than most recent: going back to redo S1HW2 should not make
+    the next new assignment S1HW3 when you have already worked through S2.
+    """
+    seen = [(int(m.group(1)), int(m.group(2)))
+            for m in (ASSIGNMENT_RE.match(x or "") for x in labels) if m]
+    if not seen:
+        return None
+    s, hw = max(seen)
+    return f"S{s}HW{hw + 1}" if hw < HW_PER_SESSION else f"S{s + 1}HW1"
 
 
 def fmt_wpm(v) -> str:
@@ -2102,9 +2121,10 @@ def new_group(con, op=None):
     """A group is one homework assignment. Drill and speed are asked per
     session, because a single assignment alternates copy and send and can
     change drill partway through."""
+    nxt = next_assignment(g["assignment"] for g in all_groups(con, op["id"] if op else None))
     while True:
         rule("New assignment")
-        assignment = ask_text("Assignment (e.g. S2HW3)")
+        assignment = ask_text("Assignment" if nxt else "Assignment (e.g. S2HW3)", nxt)
         if ask_yes_no(f"   start assignment {bold(assignment)}?"):
             gid = create_group(con, assignment=assignment, label=assignment,
                                operator_id=op["id"] if op else None)
@@ -3008,6 +3028,22 @@ def cmd_selftest(args) -> int:
               sum(len(set(g)) > 1 for g in wide) >= 3)
         check("and still covers every character", set("".join(wide)) == set("ABCDEFGH"))
 
+        # assignment numbering: HW 1-3, then the session rolls over
+        check("next after HW1", next_assignment(["S1HW1"]) == "S1HW2")
+        check("HW rolls over into the next session",
+              next_assignment(["S1HW3"]) == "S2HW1")
+        check("it follows the highest, not the most recent",
+              next_assignment(["S2HW3", "S1HW1"]) == "S3HW1")
+        check("lower case is fine", next_assignment(["s1hw2"]) == "S1HW3")
+        check("double-digit sessions carry",
+              next_assignment(["S9HW3", "S10HW2"]) == "S10HW3")
+        check("free-form labels are ignored",
+              next_assignment(["S1HW1", "warmup", "S2HW2"]) == "S2HW3")
+        check("an out-of-range HW is not the pattern",
+              next_assignment(["S1HW4"]) is None)
+        check("nothing to go on, no suggestion",
+              next_assignment([]) is None and next_assignment(["custom"]) is None)
+
         # the pairs you mix up: both directions are one drill
         cc = Counter({("H", "S"): 2, ("S", "H"): 1, ("K", "R"): 2, ("A", "B"): 1})
         cp = confused_pairs(cc)
@@ -3078,6 +3114,8 @@ def cmd_selftest(args) -> int:
         check("unscoped listings still see everyone",
               len(all_groups(con)) == len(all_groups(con, me)) + 1)
         check("last_group is per operator", last_group(con, them)["id"] == theirs)
+        check("the next-assignment suggestion is per operator too",
+              next_assignment(g["assignment"] for g in all_groups(con, them)) is None)
         check("payload carries the operator", report_payload(
             load_all(con, them), list_operators(con))["groups"][0]["op"] == them)
         set_current_operator(con, them)

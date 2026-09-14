@@ -31,6 +31,12 @@ you add a *session*, not a new group. Drill type and speed belong to the session
 because one assignment can start on letters and finish on custom error characters.
 A new group means a new assignment.
 
+Assignment numbers fill themselves in. Homework runs `HW1`–`HW3` within a
+session and then the session rolls over, so after `S2HW3` a new group offers
+`S3HW1`; press Enter to take it or type anything else. It follows the
+highest-numbered assignment you have, not the last one you touched, so going
+back to redo an earlier one does not rewind the count.
+
 While working a lesson you replay the same clip and retype your answers until
 you are happy with them. Paste each attempt as you go — two-character groups,
 one per line, `.` for a character you did not know:

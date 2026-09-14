@@ -50,6 +50,19 @@ threshold. Thresholding per day and unioning would answer a different and much
 less useful question ("did I have a bad day with this letter"), and would drop
 exactly the characters that are quietly wrong all week.
 
+## Assignment numbering
+
+`S<session>HW<1-3>`, three homework assignments per session, then the session
+rolls over. `next_assignment` reads the operator's existing labels, takes the
+**highest** matching one rather than the most recent, and offers the successor
+as the default when a new group is started.
+
+Highest, not most recent, because going back to redo S1HW2 after finishing S2
+should not make the next new assignment S1HW3. Labels that do not match the
+pattern are skipped entirely, so a free-form group (`warmup`, `error letters`)
+neither breaks the sequence nor gets renumbered - the whole thing degrades to
+an empty default and a plain prompt.
+
 ## Sending practice
 
 `lcwo practice` reads the same trouble tally the report does and emits groups to
