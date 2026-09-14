@@ -37,6 +37,12 @@ session and then the session rolls over, so after `S2HW3` a new group offers
 highest-numbered assignment you have, not the last one you touched, so going
 back to redo an earlier one does not rewind the count.
 
+Drill and speed carry forward the same way. A second session in a group just
+asks *"Same as last session (Letters at 25/6 wpm)?"*; a brand-new assignment
+asks all three, pre-filled from your last session anywhere — a new assignment
+is exactly where the drill tends to change, so it is worth a glance rather than
+a silent copy. Three Enters and you are recording.
+
 While working a lesson you replay the same clip and retype your answers until
 you are happy with them. Paste each attempt as you go — two-character groups,
 one per line, `.` for a character you did not know:

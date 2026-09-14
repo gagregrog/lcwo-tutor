@@ -711,6 +711,20 @@ def session_runs(con, sid) -> list[sqlite3.Row]:
                        (sid,)).fetchall()
 
 
+def last_settings(con, oid=None):
+    """Drill and speed from the most recent session, whichever group it was in.
+
+    Used to seed a brand-new assignment: the speed you finished at yesterday is
+    nearly always the speed you are starting at today.
+    """
+    where, params = _owned(oid, "g")
+    return con.execute(
+        "SELECT s.mode, s.char_wpm, s.eff_wpm FROM live_sessions s"
+        " JOIN live_groups g ON g.id = s.group_id"
+        " WHERE s.char_wpm IS NOT NULL" + where +
+        " ORDER BY s.started_at DESC, s.id DESC LIMIT 1", params).fetchone()
+
+
 def start_session(con, grp, started_at=None, notes=None, mode=None,
                   char_wpm=..., eff_wpm=...) -> sqlite3.Row:
     seq = (con.execute(
@@ -2142,13 +2156,21 @@ def session_settings(con, grp):
         cur = (f"{dict(MODES).get(prev['mode'], prev['mode'])}"
                f" at {fmt_wpm(prev['char_wpm'])}/{fmt_wpm(prev['eff_wpm'])} wpm")
         if not ask_yes_no(f"  Same as last session ({cur})?"):
-            return ask_settings(prev["char_wpm"], prev["eff_wpm"])
+            return ask_settings(prev["char_wpm"], prev["eff_wpm"], prev["mode"])
         return prev["mode"], prev["char_wpm"], prev["eff_wpm"]
+    # A new assignment has no session to copy, so fall back to the last one
+    # anywhere. Every field is still asked - a new assignment is exactly where
+    # the drill tends to change - but the answers come pre-filled.
+    last = last_settings(con, _col(grp, "operator_id"))
+    if last:
+        return ask_settings(last["char_wpm"], last["eff_wpm"], last["mode"])
     return ask_settings()
 
 
-def ask_settings(char_default=25, eff_default=None):
-    mode = ask_choice("Which drill?", MODES)
+def ask_settings(char_default=25, eff_default=None, mode_default=None):
+    keys = [k for k, _ in MODES]
+    mode = ask_choice("Which drill?", MODES,
+                      default=keys.index(mode_default) + 1 if mode_default in keys else 1)
     char_wpm = ask_number("Character speed (wpm)", fmt_wpm(char_default or 25))
     eff_wpm = ask_number("Effective speed (wpm)",
                          fmt_wpm(eff_default if eff_default is not None else char_wpm))
@@ -3028,6 +3050,27 @@ def cmd_selftest(args) -> int:
               sum(len(set(g)) > 1 for g in wide) >= 3)
         check("and still covers every character", set("".join(wide)) == set("ABCDEFGH"))
 
+        # a new assignment starts from the speed the last one finished at
+        speedy = create_group(con, assignment="SPEEDY", label="SPEEDY")
+        sp1 = start_session(con, get_group(con, speedy), mode="letters",
+                            char_wpm=22, eff_wpm=7,
+                            started_at="2030-01-01T09:00:00+00:00")
+        add_run(con, sp1["id"], ["EH"], "raw", is_final=True)
+        finish_session(con, sp1["id"], ["EH"])
+        ls = last_settings(con)
+        check("last settings come from the most recent session",
+              (ls["mode"], ls["char_wpm"], ls["eff_wpm"]) == ("letters", 22, 7))
+        sp2 = start_session(con, get_group(con, speedy), mode="custom",
+                            char_wpm=28, eff_wpm=8,
+                            started_at="2030-01-02T09:00:00+00:00")
+        add_run(con, sp2["id"], ["EH"], "raw", is_final=True)
+        finish_session(con, sp2["id"], ["EH"])
+        ls = last_settings(con)
+        check("and follow the newest one",
+              (ls["mode"], ls["char_wpm"], ls["eff_wpm"]) == ("custom", 28, 8))
+        check("a session with no speed on file is skipped",
+              last_settings(con)["char_wpm"] is not None)
+
         # assignment numbering: HW 1-3, then the session rolls over
         check("next after HW1", next_assignment(["S1HW1"]) == "S1HW2")
         check("HW rolls over into the next session",
@@ -3116,6 +3159,9 @@ def cmd_selftest(args) -> int:
         check("last_group is per operator", last_group(con, them)["id"] == theirs)
         check("the next-assignment suggestion is per operator too",
               next_assignment(g["assignment"] for g in all_groups(con, them)) is None)
+        check("speed defaults are per operator too",
+              last_settings(con, them) is None
+              and last_settings(con, me)["char_wpm"] is not None)
         check("payload carries the operator", report_payload(
             load_all(con, them), list_operators(con))["groups"][0]["op"] == them)
         set_current_operator(con, them)

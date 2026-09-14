@@ -50,6 +50,19 @@ threshold. Thresholding per day and unioning would answer a different and much
 less useful question ("did I have a bad day with this letter"), and would drop
 exactly the characters that are quietly wrong all week.
 
+## Carrying settings forward
+
+Two levels, deliberately different:
+
+- **Another session in the same group** gets one yes/no — *"Same as last
+  session (Letters at 25/6 wpm)?"* — because within an assignment the settings
+  almost never move.
+- **A new assignment** asks drill, character speed and effective speed, each
+  pre-filled from the most recent session anywhere (`last_settings`, scoped to
+  the operator). A new assignment is where the drill actually changes, so
+  copying it silently would mislabel sessions; pre-filling costs one Enter and
+  keeps the answer visible.
+
 ## Assignment numbering
 
 `S<session>HW<1-3>`, three homework assignments per session, then the session
