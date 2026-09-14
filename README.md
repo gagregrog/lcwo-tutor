@@ -90,6 +90,47 @@ make trouble D=7 N=3    missed 3+ times over the last 7
 `D=2` still means your last two sessions' worth. Same threshold rule as the
 report: the count is the total over the whole window.
 
+## Sending practice
+
+The copy side tells you which characters you are missing; `make practice` turns
+that straight into something to send:
+
+```
+$ make practice D=2 C=12
+── Sending practice — last 2 practice day(s), 2026-09-10 to 2026-09-13 · W7YFR
+  from: D×9  G×5  H×4  J×4  L×4  Y×4  C×3  F×3  K×3  U×3
+
+   DD    GGG   HHH   JJJ   LL    YY
+   CJY   UF    JK    HJU   UF    CC
+```
+
+It opens with each character on its own — its rhythm with nothing to compare it
+to, worst first — then mixes them, drawn weighted by how often you missed them,
+so the worst come round most and you practise the transitions between them too.
+At most half the set is solo runs; anything crowded out that way is planted into
+the mixed groups, so every character you are working on still appears.
+
+`PAIRS=1` adds a second block for the characters you actually mix up, taken from
+the confusion table — every group in it holds both halves of the pair, because
+the thing to practise is the contrast:
+
+```
+── Confusions — the pairs you mix up
+   H ↔ S ×6        HS    SHS   SH
+   L ↔ Y ×6        LLY   LYY   LYL
+   K ↔ R ×4        RRK   KKR   RKR
+```
+
+```
+make practice              your trouble letters, all time, 24 groups
+make practice PAIRS=1      plus drills for the pairs you confuse
+make practice D=2          just what you have been missing lately
+make practice N=3 C=40     stricter threshold, longer drill
+make practice CHARS=kyv    forget the stats, practise these
+make practice PLAIN=1      one line, no formatting, for piping
+make practice SEED=7       the same set again
+```
+
 ## Commands
 
 | Command | What it does |
@@ -99,6 +140,7 @@ report: the count is the total over the whole window.
 | `make user` | who is on file, and who is being recorded for |
 | `make groups` | list groups with accuracy and trouble letters |
 | `make trouble` | trouble letters — `D=2` for the last 2 practice days, `N=3` for the threshold |
+| `make practice` | sending practice built from those letters — same `D=`/`N=`, `PAIRS=1` for confusions |
 | `make merge` | fold groups that share an assignment into one (`APPLY=1` to write) |
 | `make delete G=11` | move a group (or `S=`/`R=`) to the bin — reversible |
 | `make restore G=11` | bring it back |

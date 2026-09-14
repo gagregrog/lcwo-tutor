@@ -50,6 +50,35 @@ threshold. Thresholding per day and unioning would answer a different and much
 less useful question ("did I have a bad day with this letter"), and would drop
 exactly the characters that are quietly wrong all week.
 
+## Sending practice
+
+`lcwo practice` reads the same trouble tally the report does and emits groups to
+send. Three decisions in `practice_set` are worth recording:
+
+- **Weighted, not uniform.** Draws are weighted by miss count, so the character
+  you missed nine times comes round roughly nine times as often as the one you
+  missed once. Uniform sampling would spend the same effort on a character you
+  nearly have as on one you keep dropping.
+- **Solo runs, capped at half the set.** A run of one character (`DDD`) drills
+  its rhythm with nothing to compare it to; mixed groups (`CJY`) drill the
+  transitions, which is where sending actually falls apart. Both are needed, but
+  a ten-character trouble list would spend an entire drill on solos, so solos
+  are capped at half and the worst characters get them.
+- **Coverage is guaranteed by construction.** Characters crowded out of the solo
+  pass are planted into mixed groups as they are generated, rather than patched
+  in afterwards. Splicing them in after the fact can overwrite the only
+  appearance of some other character - the same bug, one level down.
+
+`--pairs` adds a second block built from the confusion table rather than the
+miss tally. `H` heard as `S` and `S` heard as `H` are the same two rhythms
+failing to separate, so the directions are merged into one unordered pair and
+their counts add. Every group in that block contains both characters - a group
+of one would just be the solo drill the main set already ran, and the contrast
+is the whole point.
+
+`--seed` makes a set reproducible, which is what the tests use; without it each
+run is fresh.
+
 ## The report
 
 `reports/index.html` covers one operator's practice; `reports/group-N.html` is

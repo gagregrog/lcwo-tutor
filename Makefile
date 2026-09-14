@@ -9,8 +9,8 @@ PYTHON ?= python3
 LCWO   := $(PYTHON) lcwo.py
 
 .DEFAULT_GOAL := session
-.PHONY: session record report html user groups trouble key speed delete restore \
-        trash purge db merge test clean help
+.PHONY: session record report html user groups trouble practice key speed delete \
+        restore trash purge db merge test clean help
 
 # every data target takes U=<call sign> to work as another operator
 OP = $(if $(U),-u $(U))
@@ -43,6 +43,13 @@ groups:
 ## trouble: trouble letters  [D=<last N days>] [N=<threshold>] [G=<group>]
 trouble:
 	@$(LCWO) trouble $(if $(D),-d $(D)) $(if $(N),-n $(N)) $(if $(G),-g $(G)) $(OP) $(ALL)
+
+## practice: sending practice from trouble letters  [D= N= C= CHARS= PAIRS=1]
+practice:
+	@$(LCWO) practice $(if $(D),-d $(D)) $(if $(N),-n $(N)) $(if $(C),-c $(C)) \
+		$(if $(CHARS),--chars $(CHARS)) $(if $(G),-g $(G)) \
+		$(if $(SEED),--seed $(SEED)) $(if $(PLAIN),--plain) \
+		$(if $(PAIRS),--pairs) $(OP) $(ALL)
 
 ## key: attach a results table to a session left ungraded
 key:
@@ -100,5 +107,6 @@ help:
 	@echo
 	@echo "  variables: U= operator  G= group  S= session  R= run"
 	@echo "             D= last N practice days   N= trouble threshold"
+	@echo "             C= how many groups   CHARS= practise these instead"
 	@echo "             CHAR=/EFF= wpm   Y=1 skip prompt   APPLY=1 write merge"
 	@echo "             EVERYONE=1 every operator at once"

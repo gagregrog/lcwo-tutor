@@ -28,6 +28,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import random
 import re
 import sqlite3
 import sys
@@ -852,6 +853,64 @@ def trouble_from(counts: Counter, threshold: int = TROUBLE_THRESHOLD) -> list[tu
     )
 
 
+SOLO_SHARE = 0.35  # groups that drill one character's rhythm on its own
+
+
+def practice_set(counts, n=24, rng=None, min_len=2, max_len=3) -> list[str]:
+    """Sending practice built from the characters you miss.
+
+    It opens with a run of one character on its own - its rhythm with nothing
+    to compare it to - worst first. The rest are drawn weighted by how often
+    you missed them, so the worst come round most, and mixed together so you
+    practise the transitions between them too.
+
+    At most half the set is solo runs: a ten-character trouble list would
+    otherwise spend the whole drill on single characters. Whatever gets crowded
+    out that way is planted into the mixed groups instead, so everything you
+    are working on still appears.
+    """
+    rng = rng or random.Random()
+    chars = [c for c, _ in sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))]
+    if not chars or n < 1:
+        return []
+    weights = [counts[c] for c in chars]
+    solos = chars[:max(1, min(len(chars), (n + 1) // 2))]
+    out = [c * rng.randint(min_len, max_len) for c in solos]
+    pending = chars[len(solos):n]  # owed an appearance
+    while len(out) < n:
+        k = rng.randint(min_len, max_len)
+        if not pending and rng.random() < SOLO_SHARE:
+            out.append(rng.choices(chars, weights)[0] * k)
+            continue
+        g = rng.choices(chars, weights, k=k)
+        if pending:
+            g[rng.randrange(k)] = pending.pop(0)
+        elif len(set(g)) == 1 and len(chars) > 1:
+            g = rng.choices(chars, weights, k=k)  # that is a solo; draw again
+        out.append("".join(g))
+    return out
+
+
+def pair_drill(pairs, per=3, rng=None, min_len=2, max_len=3) -> list[tuple]:
+    """For each confused pair, groups that put the two rhythms side by side.
+
+    Every group holds both characters - a group of one is just the solo drill
+    the main set already covers, and the whole point here is the contrast.
+    """
+    rng = rng or random.Random()
+    out = []
+    for a, b, n in pairs:
+        groups = []
+        while len(groups) < per:
+            k = rng.randint(min_len, max_len)
+            g = [rng.choice((a, b)) for _ in range(k)]
+            if len(set(g)) == 1:
+                g[rng.randrange(k)] = b if g[0] == a else a
+            groups.append("".join(g))
+        out.append((a, b, n, groups))
+    return out
+
+
 def load_group(con, gid) -> GroupView:
     grow = get_group(con, gid)
     if grow is None:
@@ -889,6 +948,30 @@ def char_counts(views: list[GroupView], days=None) -> tuple[Counter, Counter]:
                     miss.update(r.grade.miss_counts())
                     sent.update(r.grade.sent_counts())
     return miss, sent
+
+
+def confusion_counts(views: list[GroupView], days=None) -> Counter:
+    """(sent, heard) -> count, optionally limited to a set of days."""
+    c: Counter = Counter()
+    for v in views:
+        for s in v.sessions:
+            for r in s.runs:
+                if r.grade and (days is None or r.recorded_at[:10] in days):
+                    c.update(r.grade.confusions())
+    return c
+
+
+def confused_pairs(counts, min_count=2, top=6) -> list[tuple[str, str, int]]:
+    """Unordered pairs you mix up, worst first.
+
+    H heard as S and S heard as H are the same two rhythms failing to separate,
+    so they are one drill and their counts add.
+    """
+    merged: Counter = Counter()
+    for (a, b), n in counts.items():
+        merged[tuple(sorted((a, b)))] += n
+    ranked = sorted(merged.items(), key=lambda kv: (-kv[1], kv[0]))
+    return [(a, b, n) for (a, b), n in ranked[:top] if n >= min_count]
 
 
 def global_miss_counts(views: list[GroupView]) -> Counter:
@@ -2162,20 +2245,33 @@ def cmd_groups(args) -> int:
     return 0
 
 
-def cmd_trouble(args) -> int:
-    con = connect()
+def counts_in_scope(con, args):
+    """(operator, views, window, missed, sent) for the character commands."""
     op = scope_operator(con, args)
     views = ([load_group(con, args.group)] if args.group
              else load_all(con, op["id"] if op else None))
     window = practice_days(views)[-args.days:] if args.days else None
     counts, sent = char_counts(views, window)
-    tr = trouble_from(counts, args.threshold)
-    scope = f"group {args.group}" if args.group else "all time"
+    return op, views, window, counts, sent
+
+
+def scope_label(args, op, window) -> str:
     if window:
-        scope = (f"last {len(window)} practice day(s), "
-                 f"{fmt_ts(window[0])[:10]} to {fmt_ts(window[-1])[:10]}")
+        label = f"last {len(window)} practice day(s), {window[0]} to {window[-1]}"
+    elif args.group:
+        label = f"group {args.group}"
+    else:
+        label = "all time"
     if op and not args.group:
-        scope += f" · {op['callsign']}"
+        label += f" · {op['callsign']}"
+    return label
+
+
+def cmd_trouble(args) -> int:
+    con = connect()
+    op, _views, window, counts, sent = counts_in_scope(con, args)
+    tr = trouble_from(counts, args.threshold)
+    scope = scope_label(args, op, window)
     rule(f"Trouble letters — {scope} (missed {args.threshold}+ times)")
     if not tr:
         print(dim("  none yet"))
@@ -2185,6 +2281,58 @@ def cmd_trouble(args) -> int:
         bar = "█" * min(30, n)
         print(f"  {bold(ch)}  missed {n:>3} of {s:>3} sent  ({rate:>4})  {red(bar)}")
     con.close()
+    return 0
+
+
+def cmd_practice(args) -> int:
+    """Turn the trouble list into something to send."""
+    con = connect()
+    pairs = []
+    if args.chars:
+        # uppercased, spaces dropped, first occurrence wins - all equally weighted
+        picked = list(dict.fromkeys(normalise_call(args.chars)))
+        counts = Counter(dict.fromkeys(picked, 1))
+        scope = "your list"
+        sent = Counter()
+    else:
+        op, views, window, counts, sent = counts_in_scope(con, args)
+        counts = Counter(dict(trouble_from(counts, args.threshold)))
+        scope = scope_label(args, op, window)
+        if args.pairs:
+            pairs = confused_pairs(confusion_counts(views, window),
+                                   args.threshold, args.pair_count)
+    con.close()
+
+    rng = random.Random(args.seed) if args.seed is not None else random.Random()
+    groups = practice_set(counts, args.count, rng)
+    drills = pair_drill(pairs, rng=rng)
+    if args.plain:
+        print(" ".join(groups + [g for _a, _b, _n, gs in drills for g in gs]))
+        return 0
+    rule(f"Sending practice — {scope}")
+    if not groups:
+        print(dim(f"  nothing missed {args.threshold}+ times in that scope —"
+                  " widen it with -d/-n, or pass --chars ABCD"))
+        return 0
+    worst = sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))
+    if sent:
+        print("  " + dim("from: ") + "  ".join(
+            f"{bold(c)}{dim('×' + str(n))}" for c, n in worst))
+    else:
+        print("  " + dim("from: ") + " ".join(bold(c) for c, _ in worst))
+    print()
+    for i in range(0, len(groups), 6):
+        print("   " + "  ".join(f"{g:<4}" for g in groups[i:i + 6]).rstrip())
+    if drills:
+        rule("Confusions — the pairs you mix up")
+        for a, b, n, gs in drills:
+            print(f"   {bold(a)} {dim('↔')} {bold(b)} {dim('×' + str(n)):<10}"
+                  + "  ".join(f"{g:<4}" for g in gs).rstrip())
+    elif args.pairs and not args.chars:
+        print(dim(f"\n  no substitution seen {args.threshold}+ times in that scope"))
+    total = len(groups) + sum(len(gs) for _a, _b, _n, gs in drills)
+    print(dim(f"\n  {total} groups · send them, don't read them ·"
+              " --plain to pipe elsewhere"))
     return 0
 
 
@@ -2828,6 +2976,61 @@ def cmd_selftest(args) -> int:
         check("purge left no dangling references",
               not con.execute("PRAGMA foreign_key_check").fetchall())
 
+        # sending practice generated from a weighted trouble set
+        rng = random.Random(11)
+        ps = practice_set(Counter({"A": 9, "B": 1}), n=200, rng=rng)
+        check("practice set is the size asked for", len(ps) == 200)
+        check("practice groups only use the given characters",
+              set("".join(ps)) == {"A", "B"})
+        check("every character gets a run of its own first",
+              ps[0] == ps[0][0] * len(ps[0]) and ps[1] == ps[1][0] * len(ps[1])
+              and {ps[0][0], ps[1][0]} == {"A", "B"})
+        check("the worst character leads", ps[0][0] == "A")
+        check("group lengths stay in range", all(2 <= len(g) <= 3 for g in ps))
+        check("weighting favours the worse character",
+              "".join(ps).count("A") > 3 * "".join(ps).count("B"))
+        check("mixed groups appear", any(len(set(g)) > 1 for g in ps))
+        check("solo groups appear", sum(len(set(g)) == 1 for g in ps) > 20)
+        check("a seed repeats a set",
+              practice_set(Counter({"A": 9, "B": 1}), n=20, rng=random.Random(3))
+              == practice_set(Counter({"A": 9, "B": 1}), n=20, rng=random.Random(3)))
+        check("nothing to practise yields nothing", practice_set(Counter()) == [])
+        check("one character is all solos",
+              all(set(g) == {"Q"} for g in practice_set(Counter({"Q": 2}), n=5)))
+        small = practice_set(Counter({"A": 3, "B": 2, "C": 1}), n=3,
+                             rng=random.Random(5))
+        check("a short set still covers every character",
+              set("".join(small)) == {"A", "B", "C"})
+        check("the worst character still leads", small[0][0] == "A")
+        wide = practice_set(Counter({c: 2 for c in "ABCDEFGH"}), n=8,
+                            rng=random.Random(5))
+        check("a long trouble list still leaves room to mix",
+              sum(len(set(g)) > 1 for g in wide) >= 3)
+        check("and still covers every character", set("".join(wide)) == set("ABCDEFGH"))
+
+        # the pairs you mix up: both directions are one drill
+        cc = Counter({("H", "S"): 2, ("S", "H"): 1, ("K", "R"): 2, ("A", "B"): 1})
+        cp = confused_pairs(cc)
+        check("confusions merge in both directions", cp[0] == ("H", "S", 3))
+        check("pairs come worst first",
+              [x[:2] for x in cp] == [("H", "S"), ("K", "R")])
+        check("a one-off pair is below the threshold",
+              all(x[:2] != ("A", "B") for x in cp))
+        check("top caps the list", len(confused_pairs(cc, top=1)) == 1)
+        pd = pair_drill(cp, per=3, rng=random.Random(4))
+        check("one drill per pair", len(pd) == 2 and all(len(x[3]) == 3 for x in pd))
+        check("pair groups use only their two characters",
+              all(set(g) <= {a, b} for a, b, _n, gs in pd for g in gs))
+        check("every pair group holds both characters",
+              all(set(g) == {a, b} for a, b, _n, gs in pd for g in gs))
+        check("a seed repeats a pair drill",
+              pair_drill(cp, rng=random.Random(4)) == pair_drill(cp, rng=random.Random(4)))
+        check("no confusions, no drill", pair_drill([]) == [])
+        check("confusions are read from the graded runs",
+              confusion_counts([load_group(con, gid)])[("H", "S")] == 1)
+        check("a window filters confusions",
+              not confusion_counts([load_group(con, gid)], days=["1999-01-01"]))
+
         # a window over the days actually practised, for "how did this week go"
         span = create_group(con, assignment="SPAN", label="SPAN")
         for i, day in enumerate(("2026-03-01", "2026-03-02", "2026-03-05")):
@@ -2990,6 +3193,21 @@ def main(argv=None) -> int:
     k.add_argument("-s", "--session", type=int)
     k.set_defaults(fn=cmd_key)
 
+    pr = sub.add_parser("practice", help="sending practice from your trouble letters")
+    pr.add_argument("-g", "--group", type=int)
+    pr.add_argument("-n", "--threshold", type=int, default=TROUBLE_THRESHOLD)
+    pr.add_argument("-d", "--days", type=int, metavar="N",
+                    help="only the last N days you practised")
+    pr.add_argument("-c", "--count", type=int, default=24, help="how many groups")
+    pr.add_argument("--chars", help="use these characters instead of the trouble list")
+    pr.add_argument("--pairs", action="store_true",
+                    help="add drills for the characters you mix up")
+    pr.add_argument("--pair-count", type=int, default=6, metavar="N",
+                    help="how many confused pairs to drill (with --pairs)")
+    pr.add_argument("--plain", action="store_true", help="just the groups, one line")
+    pr.add_argument("--seed", type=int, help="repeat an earlier set")
+    pr.set_defaults(fn=cmd_practice)
+
     sp = sub.add_parser("speed", help="show or set a group's speed")
     sp.add_argument("-g", "--group", type=int)
     sp.add_argument("--char", type=float, help="character speed in wpm")
@@ -3017,12 +3235,12 @@ def main(argv=None) -> int:
     sub.add_parser("selftest", help="run built-in checks").set_defaults(fn=cmd_selftest)
 
     # every command that reads or writes practice data works on one operator
-    for pr in (rec, grp, r, t, k, sp):
-        pr.add_argument("-u", "--user", metavar="WHO",
-                        help="operator: call sign, name, or id")
-    for pr in (grp, r, t):
-        pr.add_argument("--everyone", action="store_true",
-                        help="every operator, not just the current one")
+    for q in (rec, grp, r, t, k, sp, pr):
+        q.add_argument("-u", "--user", metavar="WHO",
+                       help="operator: call sign, name, or id")
+    for q in (grp, r, t, pr):
+        q.add_argument("--everyone", action="store_true",
+                       help="every operator, not just the current one")
 
     args = ap.parse_args(argv)
     if not getattr(args, "fn", None):
