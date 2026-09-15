@@ -1407,15 +1407,22 @@ function panelPractice(f, runs, st){
     : `<p class="none">nothing missed ${TH}+ times in this scope.</p>`;
 
   const kids = children(f, runs);
-  const showKids = tr.length && kids.length > 1;
-  const kidStats = showKids ? kids.map(k => ({...k, st: stats(k.runs)})) : [];
+  // the split columns need something to split; Sent/Missed/Correct do not
+  const kidStats = kids.length > 1 ? kids.map(k => ({...k, st: stats(k.runs)})) : [];
   const head = `<th>Char</th>${kidStats.map(k =>
       `<th class="num" title="${esc(k.name)}">${esc(k.short)}</th>`).join('')}
-    <th class="num">Sent</th><th class="num">Missed</th>`;
-  const rows = tr.map(([c, m]) => `<tr><td class="mono" style="font-weight:700">${esc(c)}</td>
+    <th class="num">Sent</th><th class="num">Missed</th><th class="num">Correct</th>`;
+  const rows = tr.map(([c, m]) => {
+    const sent = st.sent.get(c) || 0;
+    const right = sent ? Math.max(0, 100 * (sent - m.total) / sent) : null;
+    return `<tr><td class="mono" style="font-weight:700">${esc(c)}</td>
     ${kidStats.map(k => `<td class="num">${k.st.miss.get(c)?.total || ''}</td>`).join('')}
-    <td class="num">${st.sent.get(c) || 0}</td>
-    <td class="num" style="font-weight:700">${m.total}</td></tr>`);
+    <td class="num">${sent}</td>
+    <td class="num" style="font-weight:700">${m.total}</td>
+    <td class="num" style="font-weight:700${right == null ? ''
+      : `;color:hsl(${hue(right, 50).toFixed(0)} 62% var(--barL))`}">${
+      right == null ? '&mdash;' : right.toFixed(0) + '%'}</td></tr>`;
+  });
 
   const conf = [...st.conf.entries()].sort((a, b) => b[1] - a[1]).slice(0, 12);
   const confHtml = conf.length
@@ -1427,7 +1434,7 @@ function panelPractice(f, runs, st){
 
   return `<div class="cols">
     <div class="panel"><h3>Practice these (missed ${TH}+ times)</h3>${chips}
-      ${showKids ? table(head, rows) : ''}</div>
+      ${table(head, rows)}</div>
     <div class="panel"><h3>Confusions &mdash; heard as something else</h3>${confHtml}</div>
   </div>`;
 }

@@ -77,7 +77,9 @@ is set:
   filter covers**, not per day. Miss `W` once on Tuesday and once on Wednesday
   and a two-day range lists it at ×2; the columns beside it decompose that
   total by day (or session, or assignment) rather than each applying the
-  threshold again
+  threshold again. The rightmost column is how often you got it **right** —
+  `D` missed 11 of 122 sent reads 91% — coloured red through green, so a
+  character you are mostly getting is easy to tell from one you are not
 - **Confusions** — `Y → L ×5`, `K → R ×4`. Usually the most useful panel: a
   consistent substitution means two rhythms you are conflating, which needs a
   different fix from a character you simply do not know

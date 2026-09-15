@@ -229,6 +229,32 @@ check('the day columns sum back to the listed total',
       kids.length === days.length && combined.every(([c, m]) =>
         kids.reduce((n, k) => n + (stats(k.runs).miss.get(c)?.total || 0), 0) === m.total));
 
+// ---- the practice table carries a correct-rate column ----
+setFilter({...EMPTY});
+const cells = () => [...document.getElementById('app').innerHTML.matchAll(
+  /<tr><td class="mono"[^>]*>([A-Z0-9])<\/td>([\s\S]*?)<\/tr>/g)]
+  .map(([, ch, body]) => [ch, [...body.matchAll(/<td class="num"[^>]*>(.*?)<\/td>/g)]
+    .map(m => m[1])]);
+check('the practice table has a Correct column',
+      document.getElementById('app').innerHTML.includes('>Correct<'));
+const listed = cells().filter(([ch]) => combined.some(([c]) => c === ch));
+check('every trouble character has a row', listed.length === combined.length,
+      listed.length + ' vs ' + combined.length);
+check('correct% is sent minus missed, over sent',
+      listed.every(([, cs]) => {
+        const [sent, missed, pct] = cs.slice(-3);
+        return pct === Math.round(100 * (sent - missed) / sent) + '%';
+      }), JSON.stringify(listed[0]));
+check('the percentage is the rightmost column',
+      listed.every(([, cs]) => /^\d+%$/.test(cs[cs.length - 1])));
+// a scope with only one child used to hide the table entirely, taking the
+// Sent/Missed/Correct numbers with it
+setFilter({from: days[0], to: days[0]});
+check('one child still shows the table',
+      children(F, filterRuns(F)).length === 1
+      && document.getElementById('app').innerHTML.includes('>Correct<'));
+setFilter({...EMPTY});
+
 // ---- the breakdown follows whatever is pinned ----
 setFilter({...EMPTY});
 check('a multi-day view breaks down by day',
